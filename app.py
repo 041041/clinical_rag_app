@@ -1,11 +1,22 @@
 # app.py
 import os
+import asyncio
 from pathlib import Path
 from typing import List
 
 import streamlit as st
 
-# document loaders
+# Ensure an asyncio event loop exists for the current thread (Streamlit-related fix)
+def ensure_event_loop():
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+ensure_event_loop()
+
+# Document loaders
 from langchain_community.document_loaders import (
     PyPDFLoader,
     TextLoader,
@@ -15,39 +26,25 @@ from langchain_community.document_loaders import (
 )
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
-# embeddings / LLM
+# embeddings and llm
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 
-# Chroma vectorstore (portable for Streamlit Cloud)
+# Chroma vectorstore
 from langchain.vectorstores import Chroma
 
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 
-# put this near the top of app.py (right after imports)
-import asyncio
-
-def ensure_event_loop():
-    try:
-        # If there's already a running loop, this is OK
-        asyncio.get_running_loop()
-    except RuntimeError:
-        # No loop in this thread — create and set one
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-ensure_event_loop()
- 
 # -------------------------
 # CONFIG
 # -------------------------
-BASE_DATA_DIR = Path("data")     # per-user folders live here
-INDEX_SUBDIR   = "rag_index"
-EMBED_MODEL    = "models/embedding-001"
-LLM_MODEL      = "gemini-1.5-flash"
-RETRIEVER_K    = 8
-CHUNK_SIZE     = 800
-CHUNK_OVERLAP  = 150
+BASE_DATA_DIR = Path("data")
+INDEX_SUBDIR = "rag_index"
+EMBED_MODEL = "models/embedding-001"
+LLM_MODEL = "gemini-1.5-flash"
+RETRIEVER_K = 8
+CHUNK_SIZE = 800
+CHUNK_OVERLAP = 150
 
 BASE_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -76,7 +73,7 @@ def _get_loader_for_path(fp: Path):
 
 def load_documents_from_folder(folder: Path) -> List:
     docs = []
-    patterns = ["*.pdf","*.txt","*.md","*.csv","*.docx","*.html","*.htm"]
+    patterns = ["*.pdf", "*.txt", "*.md", "*.csv", "*.docx", "*.html", "*.htm"]
     for pattern in patterns:
         for fp in sorted(folder.rglob(pattern)):
             Loader = _get_loader_for_path(fp)
@@ -88,12 +85,18 @@ def load_documents_from_folder(folder: Path) -> List:
                 else:
                     loader = Loader(str(fp))
                 file_docs = loader.load()
+                # attach source metadata (filename only)
                 for d in file_docs:
                     d.metadata = getattr(d, "metadata", {}) or {}
                     d.metadata["source"] = fp.name
                 docs.extend(file_docs)
+                # Log to Streamlit (only if running in Streamlit context)
+                try:
+                    st.info(f"Loaded {len(file_docs)} docs from {fp.name}")
+                except Exception:
+                    pass
             except Exception as e:
-                # show small warning in UI context if called from Streamlit
+                # show a friendly warning in UI and continue
                 try:
                     st.warning(f"Skipped {fp.name}: {e}")
                 except Exception:
@@ -101,41 +104,72 @@ def load_documents_from_folder(folder: Path) -> List:
     return docs
 
 def build_chroma_index(data_folder: Path, index_folder: Path):
+    """
+    Build a Chroma index. Try persistent Chroma (disk). If that fails
+    (eg. unsupported sqlite on host), fall back to in-memory Chroma.
+    """
     docs = load_documents_from_folder(data_folder)
     if not docs:
         raise ValueError("No supported files found to index.")
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP,
-        separators=["\n\n","\n"," ",""]
+        chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP, separators=["\n\n", "\n", " ", ""]
     )
     chunks = splitter.split_documents(docs)
 
     embeddings = GoogleGenerativeAIEmbeddings(model=EMBED_MODEL)
-
     persist_directory = str(index_folder)
-    # build and persist Chroma DB
-    vs = Chroma.from_documents(documents=chunks, embedding=embeddings, persist_directory=persist_directory)
-    # .persist() may not be necessary depending on langchain version; call if available
+
+    # Try persistent Chroma
     try:
-        vs.persist()
-    except Exception:
-        pass
-    return vs
+        vs = Chroma.from_documents(documents=chunks, embedding=embeddings, persist_directory=persist_directory)
+        try:
+            # persist if available
+            vs.persist()
+        except Exception:
+            pass
+        try:
+            st.info("Persistent Chroma index built.")
+        except Exception:
+            pass
+        return vs
+    except Exception as e:
+        # fallback to in-memory Chroma for demos
+        try:
+            st.warning(f"Persistent Chroma failed ({e}). Falling back to in-memory index (non-persistent).")
+        except Exception:
+            pass
+        try:
+            vs = Chroma.from_documents(documents=chunks, embedding=embeddings)
+            return vs
+        except Exception as e2:
+            raise RuntimeError(f"Failed to build Chroma index. Persistent error: {e}; in-memory error: {e2}")
 
 def load_or_build_index_for_user(user_folder: Path):
+    """
+    Try to load a persistent Chroma DB if present; if not present, attempt to build.
+    If load fails due to system sqlite, fall back to in-memory.
+    """
     index_path = user_folder / INDEX_SUBDIR
+
+    # If a persistent index folder exists, try loading it
     if index_path.exists() and any(index_path.iterdir()):
         embeddings = GoogleGenerativeAIEmbeddings(model=EMBED_MODEL)
-        # load existing chroma persistence
         try:
             vs = Chroma(persist_directory=str(index_path), embedding_function=embeddings)
+            try:
+                st.info("Loaded existing persistent Chroma index.")
+            except Exception:
+                pass
             return vs
         except Exception as e:
-            # fallback to rebuilding if load fails
-            st.warning(f"Failed to load existing index (will rebuild): {e}")
-            return build_chroma_index(user_folder, index_path)
-    else:
-        return build_chroma_index(user_folder, index_path)
+            try:
+                st.warning(f"Failed to load persistent Chroma index ({e}). Rebuilding (may fall back to in-memory).")
+            except Exception:
+                pass
+            # fall through to rebuilding
+
+    # Build (will try persistent, then fallback to in-memory)
+    return build_chroma_index(user_folder, index_path)
 
 def create_qa_chain(vectorstore):
     retriever = vectorstore.as_retriever(search_kwargs={"k": RETRIEVER_K})
@@ -159,7 +193,6 @@ def create_qa_chain(vectorstore):
     )
     return qa
 
-
 # -------------------------
 # Streamlit UI
 # -------------------------
@@ -172,13 +205,20 @@ user_folder = get_user_folder(username)
 
 uploaded = st.sidebar.file_uploader(
     "Upload files (PDF, DOCX, TXT, CSV, MD, HTML)",
-    type=["pdf","docx","txt","csv","md","html"], accept_multiple_files=True
+    type=["pdf", "docx", "txt", "csv", "md", "html"],
+    accept_multiple_files=True,
 )
 if uploaded:
+    saved = 0
     for f in uploaded:
-        (user_folder / f.name).write_bytes(f.getbuffer())
-    st.sidebar.success(f"Saved {len(uploaded)} file(s) to {user_folder}")
+        try:
+            (user_folder / f.name).write_bytes(f.getbuffer())
+            saved += 1
+        except Exception as e:
+            st.warning(f"Failed to save {f.name}: {e}")
+    st.sidebar.success(f"Saved {saved} file(s) to {user_folder}")
 
+# Manual build button
 if st.sidebar.button("🔧 Build / Rebuild Index"):
     try:
         with st.spinner("Indexing… this may take a few minutes for large files."):
@@ -189,42 +229,82 @@ if st.sidebar.button("🔧 Build / Rebuild Index"):
 
 st.sidebar.markdown("### Your files")
 files = sorted([p.name for p in user_folder.rglob("*") if p.is_file()])
-st.sidebar.write("\n".join(f"- {f}" for f in files) if files else "No files yet.")
+if files:
+    for fname in files:
+        st.sidebar.write("-", fname)
+else:
+    st.sidebar.write("No files yet. Upload on the left and then click Build / Rebuild Index.")
 
 st.header("🔎 Search")
 q = st.text_area("Ask a question about your uploaded docs", height=120)
 
+# Improved Search handling with auto-build when files exist
 if st.button("Search"):
     if not q.strip():
         st.warning("Type a question first.")
     elif not os.environ.get("GOOGLE_API_KEY"):
         st.error("Missing GOOGLE_API_KEY — set as an environment variable or Streamlit secret.")
     else:
-        with st.spinner("Loading index (or building if missing)…"):
+        user_files = sorted([p for p in user_folder.rglob("*") if p.is_file()])
+        if not user_files:
+            st.error(
+                "No files found in your folder. Upload files using the sidebar uploader and then click "
+                "'Build / Rebuild Index' (or upload and the app will build automatically)."
+            )
+        else:
+            st.info(f"Found {len(user_files)} file(s) in your folder. Checking index...")
+            index_path = user_folder / INDEX_SUBDIR
+            # If index missing, auto-build
+            if not index_path.exists() or not any(index_path.iterdir()):
+                with st.spinner("Index not found — building index now (this may take a few minutes)..."):
+                    try:
+                        build_chroma_index(user_folder, index_path)
+                        st.success("Index built successfully.")
+                    except Exception as e:
+                        st.error(f"Failed to build index: {e}")
+                        st.markdown("**Files found (for debugging):**")
+                        for fp in user_files:
+                            st.write("-", fp.name)
+                        # try to show sample extract of first file
+                        try:
+                            sample_fp = user_files[0]
+                            Loader = PyPDFLoader if sample_fp.suffix.lower() == ".pdf" else TextLoader
+                            loader = Loader(str(sample_fp)) if Loader is PyPDFLoader else Loader(str(sample_fp), encoding="utf-8")
+                            sample_docs = loader.load()
+                            if sample_docs:
+                                st.markdown("**Sample extract (first doc):**")
+                                st.code(sample_docs[0].page_content[:800])
+                        except Exception:
+                            pass
+                        st.stop()
+
+            # load the index and run QA
             try:
                 db = load_or_build_index_for_user(user_folder)
             except Exception as e:
-                db = None
                 st.error(f"Error loading index: {e}")
-        if db:
-            qa = create_qa_chain(db)
-            with st.spinner("Retrieving and generating answer…"):
-                try:
-                    out = qa.invoke({"query": q})
-                except Exception as e:
-                    st.error(f"LLM/query error: {e}")
-                    out = None
-            if out:
-                st.subheader("Answer")
-                st.write(out.get("result","").strip())
+                db = None
 
-                st.subheader("Sources (unique)")
-                uniq = list({d.metadata.get("source","unknown") for d in out.get("source_documents",[])})
-                if uniq:
-                    for s in uniq: st.write("-", s)
-                else:
-                    st.write("No sources returned.")
+            if db:
+                qa = create_qa_chain(db)
+                with st.spinner("Retrieving and generating answer…"):
+                    try:
+                        out = qa.invoke({"query": q})
+                    except Exception as e:
+                        st.error(f"LLM/query error: {e}")
+                        out = None
+                if out:
+                    st.subheader("Answer")
+                    st.write(out.get("result", "").strip())
 
-                st.subheader("Evidence snippets")
-                for i, d in enumerate(out.get("source_documents", [])[:6], 1):
-                    st.markdown(f"**{i}. {d.metadata.get('source','unknown')}** — {d.page_content[:500].replace('\\n',' ')}…")
+                    st.subheader("Sources (unique)")
+                    uniq = list({d.metadata.get("source", "unknown") for d in out.get("source_documents", [])})
+                    if uniq:
+                        for s in uniq:
+                            st.write("-", s)
+                    else:
+                        st.write("No sources returned.")
+
+                    st.subheader("Evidence snippets")
+                    for i, d in enumerate(out.get("source_documents", [])[:6], 1):
+                        st.markdown(f"**{i}. {d.metadata.get('source','unknown')}** — {d.page_content[:500].replace('\\n', ' ')}…")
