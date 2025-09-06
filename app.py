@@ -246,9 +246,6 @@ def create_qa_from_retriever(retriever):
         chain_type_kwargs={"prompt": prompt_template},
     )
     return qa
-
-
-
 # -------------------------
 # Streamlit UI
 # -------------------------
