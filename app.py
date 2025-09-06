@@ -167,6 +167,9 @@ class SimpleRetriever:
 # Adapter that is pydantic-friendly for LangChain
 from langchain.schema import BaseRetriever
 
+# Adapter that is pydantic-friendly for LangChain
+from langchain.schema import BaseRetriever
+
 class SimpleRetrieverAdapter(BaseRetriever):
     # allow arbitrary extra attributes (pydantic v2 style)
     model_config = {"extra": "allow"}
@@ -181,6 +184,7 @@ class SimpleRetrieverAdapter(BaseRetriever):
     async def aget_relevant_documents(self, query: str):
         # async wrapper in case LangChain calls this
         return self.get_relevant_documents(query)
+
 
 
 # -------------------------
