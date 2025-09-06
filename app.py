@@ -3,7 +3,10 @@ import os
 import asyncio
 from pathlib import Path
 from typing import List
+import pickle
+from math import sqrt
 
+import numpy as np
 import streamlit as st
 
 # Ensure an asyncio event loop exists for the current thread (Streamlit-related fix)
@@ -16,7 +19,7 @@ def ensure_event_loop():
 
 ensure_event_loop()
 
-# Document loaders
+# LangChain loaders and helpers
 from langchain_community.document_loaders import (
     PyPDFLoader,
     TextLoader,
@@ -25,13 +28,12 @@ from langchain_community.document_loaders import (
     UnstructuredHTMLLoader,
 )
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.docstore.document import Document
 
-# embeddings and llm
+# embeddings / LLM
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 
-# Chroma vectorstore
-from langchain.vectorstores import Chroma
-
+# LangChain chain & prompt
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 
@@ -46,10 +48,14 @@ RETRIEVER_K = 8
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 150
 
+# files inside index folder
+VECTORS_FILE = "vectors.npy"
+META_FILE = "meta.pkl"
+
 BASE_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # -------------------------
-# Helpers
+# Helpers: file loaders / splitting
 # -------------------------
 def get_user_folder(username: str) -> Path:
     uname = "".join(c for c in username if c.isalnum() or c in ("_", "-")).strip() or "anonymous"
@@ -71,7 +77,7 @@ def _get_loader_for_path(fp: Path):
         return UnstructuredHTMLLoader
     return None
 
-def load_documents_from_folder(folder: Path) -> List:
+def load_documents_from_folder(folder: Path) -> List[Document]:
     docs = []
     patterns = ["*.pdf", "*.txt", "*.md", "*.csv", "*.docx", "*.html", "*.htm"]
     for pattern in patterns:
@@ -85,111 +91,128 @@ def load_documents_from_folder(folder: Path) -> List:
                 else:
                     loader = Loader(str(fp))
                 file_docs = loader.load()
-                # attach source metadata (filename only)
                 for d in file_docs:
                     d.metadata = getattr(d, "metadata", {}) or {}
                     d.metadata["source"] = fp.name
                 docs.extend(file_docs)
-                # Log to Streamlit (only if running in Streamlit context)
                 try:
                     st.info(f"Loaded {len(file_docs)} docs from {fp.name}")
                 except Exception:
                     pass
             except Exception as e:
-                # show a friendly warning in UI and continue
                 try:
                     st.warning(f"Skipped {fp.name}: {e}")
                 except Exception:
                     pass
     return docs
 
-def build_chroma_index(data_folder: Path, index_folder: Path):
-    """
-    Build a Chroma index. Try persistent Chroma (disk). If that fails
-    (eg. unsupported sqlite on host), fall back to in-memory Chroma.
-    """
+# -------------------------
+# Simple vector store (numpy + pickle)
+# -------------------------
+def persist_simple_index(index_folder: Path, vectors: np.ndarray, docs: List[Document]):
+    index_folder.mkdir(parents=True, exist_ok=True)
+    np.save(index_folder / VECTORS_FILE, vectors)
+    meta = [{"page_content": d.page_content, "metadata": getattr(d, "metadata", {})} for d in docs]
+    with open(index_folder / META_FILE, "wb") as f:
+        pickle.dump(meta, f)
+
+def load_simple_index(index_folder: Path):
+    vpath = index_folder / VECTORS_FILE
+    mpath = index_folder / META_FILE
+    if not vpath.exists() or not mpath.exists():
+        return None, None
+    vectors = np.load(vpath)
+    with open(mpath, "rb") as f:
+        meta = pickle.load(f)
+    docs = []
+    for m in meta:
+        docs.append(Document(page_content=m["page_content"], metadata=m.get("metadata", {})))
+    return vectors, docs
+
+def cosine_sim_matrix(vecs: np.ndarray, qvec: np.ndarray):
+    # vecs: (n, d), qvec: (d,)
+    # compute cosine similarities fast
+    denom = (np.linalg.norm(vecs, axis=1) * (np.linalg.norm(qvec) + 1e-12)) + 1e-12
+    sims = np.dot(vecs, qvec) / denom
+    sims = np.nan_to_num(sims)
+    return sims
+
+class SimpleRetriever:
+    def __init__(self, vectors: np.ndarray, docs: List[Document], embeddings, k=8):
+        self.vectors = vectors
+        self.docs = docs
+        self.embeddings = embeddings
+        self.k = k
+
+    def get_relevant_documents(self, query: str) -> List[Document]:
+        # embed the query
+        try:
+            if hasattr(self.embeddings, "embed_query"):
+                qvec = np.array(self.embeddings.embed_query(query))
+            else:
+                qvec = np.array(self.embeddings.embed_documents([query]))[0]
+        except Exception:
+            # fallback to embed_documents in loop
+            qvec = np.array(self.embeddings.embed_documents([query]))[0]
+
+        sims = cosine_sim_matrix(self.vectors, qvec)
+        topk = sims.argsort()[::-1][: self.k]
+        docs_out = [self.docs[i] for i in topk]
+        return docs_out
+
+# -------------------------
+# Build / load simple index
+# -------------------------
+def build_simple_index(data_folder: Path, index_folder: Path):
     docs = load_documents_from_folder(data_folder)
     if not docs:
         raise ValueError("No supported files found to index.")
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP, separators=["\n\n", "\n", " ", ""]
-    )
+    splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP,
+                                             separators=["\n\n", "\n", " ", ""])
     chunks = splitter.split_documents(docs)
 
     embeddings = GoogleGenerativeAIEmbeddings(model=EMBED_MODEL)
-    persist_directory = str(index_folder)
 
-    # Try persistent Chroma
+    texts = [d.page_content for d in chunks]
+    # embed documents (may be expensive)
     try:
-        vs = Chroma.from_documents(documents=chunks, embedding=embeddings, persist_directory=persist_directory)
-        try:
-            # persist if available
-            vs.persist()
-        except Exception:
-            pass
-        try:
-            st.info("Persistent Chroma index built.")
-        except Exception:
-            pass
-        return vs
-    except Exception as e:
-        # fallback to in-memory Chroma for demos
-        try:
-            st.warning(f"Persistent Chroma failed ({e}). Falling back to in-memory index (non-persistent).")
-        except Exception:
-            pass
-        try:
-            vs = Chroma.from_documents(documents=chunks, embedding=embeddings)
-            return vs
-        except Exception as e2:
-            raise RuntimeError(f"Failed to build Chroma index. Persistent error: {e}; in-memory error: {e2}")
+        vecs = embeddings.embed_documents(texts)
+    except Exception:
+        vecs = []
+        for t in texts:
+            vecs.append(embeddings.embed_documents([t])[0])
 
-def load_or_build_index_for_user(user_folder: Path):
-    """
-    Try to load a persistent Chroma DB if present; if not present, attempt to build.
-    If load fails due to system sqlite, fall back to in-memory.
-    """
+    vectors = np.array(vecs)
+    persist_simple_index(index_folder, vectors, chunks)
+    retriever = SimpleRetriever(vectors=vectors, docs=chunks, embeddings=embeddings, k=RETRIEVER_K)
+    return retriever
+
+def load_or_build_simple_index_for_user(user_folder: Path):
     index_path = user_folder / INDEX_SUBDIR
+    vectors, docs = load_simple_index(index_path)
+    embeddings = GoogleGenerativeAIEmbeddings(model=EMBED_MODEL)
+    if vectors is not None and docs is not None:
+        return SimpleRetriever(vectors=vectors, docs=docs, embeddings=embeddings, k=RETRIEVER_K)
+    # else build
+    return build_simple_index(user_folder, index_path)
 
-    # If a persistent index folder exists, try loading it
-    if index_path.exists() and any(index_path.iterdir()):
-        embeddings = GoogleGenerativeAIEmbeddings(model=EMBED_MODEL)
-        try:
-            vs = Chroma(persist_directory=str(index_path), embedding_function=embeddings)
-            try:
-                st.info("Loaded existing persistent Chroma index.")
-            except Exception:
-                pass
-            return vs
-        except Exception as e:
-            try:
-                st.warning(f"Failed to load persistent Chroma index ({e}). Rebuilding (may fall back to in-memory).")
-            except Exception:
-                pass
-            # fall through to rebuilding
+# -------------------------
+# LLM prompt / QA builder
+# -------------------------
+PROMPT_TEMPLATE_STR = (
+    "You are an expert assistant for clinical trial data standards. Use only the provided context to answer.\n"
+    "If the answer isn't in the context, say 'I don't know from provided docs.' Be concise and use bullet points when helpful.\n\n"
+    "Question: {question}\nContext:\n{context}\n\nAnswer:"
+)
+prompt_template = PromptTemplate(input_variables=["question", "context"], template=PROMPT_TEMPLATE_STR)
 
-    # Build (will try persistent, then fallback to in-memory)
-    return build_chroma_index(user_folder, index_path)
-
-def create_qa_chain(vectorstore):
-    retriever = vectorstore.as_retriever(search_kwargs={"k": RETRIEVER_K})
-    prompt = PromptTemplate(
-        input_variables=["question", "context"],
-        template=(
-            "You are an expert assistant for clinical trial data standards. "
-            "Use only the provided context to answer. "
-            "If the answer isn't in the context, say \"I don't know from provided docs.\" "
-            "Be concise and use bullet points when helpful.\n\n"
-            "Question: {question}\n"
-            "Context:\n{context}\n\n"
-            "Answer:"
-        ),
-    )
+def create_qa_from_retriever(retriever):
+    # build RetrievalQA from retriever (our retriever implements get_relevant_documents)
     qa = RetrievalQA.from_chain_type(
         llm=ChatGoogleGenerativeAI(model=LLM_MODEL, temperature=0.2, max_output_tokens=1024),
         retriever=retriever,
         return_source_documents=True,
-        chain_type_kwargs={"prompt": prompt},
+        chain_type_kwargs={"prompt": prompt_template},
     )
     return qa
 
@@ -197,7 +220,7 @@ def create_qa_chain(vectorstore):
 # Streamlit UI
 # -------------------------
 st.set_page_config(page_title="Clinical Docs Search", layout="wide")
-st.title("📚 Clinical Docs Search (per-user RAG)")
+st.title("📚 Clinical Docs Search (simple vector store)")
 
 st.sidebar.header("User & Files")
 username = st.sidebar.text_input("Your username (team name or email)", value="guest")
@@ -218,11 +241,10 @@ if uploaded:
             st.warning(f"Failed to save {f.name}: {e}")
     st.sidebar.success(f"Saved {saved} file(s) to {user_folder}")
 
-# Manual build button
 if st.sidebar.button("🔧 Build / Rebuild Index"):
     try:
         with st.spinner("Indexing… this may take a few minutes for large files."):
-            build_chroma_index(user_folder, user_folder / INDEX_SUBDIR)
+            build_simple_index(user_folder, user_folder / INDEX_SUBDIR)
         st.sidebar.success("Index built ✅")
     except Exception as e:
         st.sidebar.error(f"Index build failed: {e}")
@@ -238,7 +260,6 @@ else:
 st.header("🔎 Search")
 q = st.text_area("Ask a question about your uploaded docs", height=120)
 
-# Improved Search handling with auto-build when files exist
 if st.button("Search"):
     if not q.strip():
         st.warning("Type a question first.")
@@ -254,18 +275,17 @@ if st.button("Search"):
         else:
             st.info(f"Found {len(user_files)} file(s) in your folder. Checking index...")
             index_path = user_folder / INDEX_SUBDIR
-            # If index missing, auto-build
             if not index_path.exists() or not any(index_path.iterdir()):
                 with st.spinner("Index not found — building index now (this may take a few minutes)..."):
                     try:
-                        build_chroma_index(user_folder, index_path)
+                        build_simple_index(user_folder, index_path)
                         st.success("Index built successfully.")
                     except Exception as e:
                         st.error(f"Failed to build index: {e}")
                         st.markdown("**Files found (for debugging):**")
                         for fp in user_files:
                             st.write("-", fp.name)
-                        # try to show sample extract of first file
+                        # show a short sample from first file for debugging
                         try:
                             sample_fp = user_files[0]
                             Loader = PyPDFLoader if sample_fp.suffix.lower() == ".pdf" else TextLoader
@@ -278,15 +298,15 @@ if st.button("Search"):
                             pass
                         st.stop()
 
-            # load the index and run QA
+            # load retriever and run QA
             try:
-                db = load_or_build_index_for_user(user_folder)
+                retriever = load_or_build_simple_index_for_user(user_folder)
             except Exception as e:
                 st.error(f"Error loading index: {e}")
-                db = None
+                retriever = None
 
-            if db:
-                qa = create_qa_chain(db)
+            if retriever:
+                qa = create_qa_from_retriever(retriever)
                 with st.spinner("Retrieving and generating answer…"):
                     try:
                         out = qa.invoke({"query": q})
