@@ -24,6 +24,20 @@ from langchain.vectorstores import Chroma
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 
+# put this near the top of app.py (right after imports)
+import asyncio
+
+def ensure_event_loop():
+    try:
+        # If there's already a running loop, this is OK
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # No loop in this thread — create and set one
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+ensure_event_loop()
+ 
 # -------------------------
 # CONFIG
 # -------------------------
