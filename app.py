@@ -169,6 +169,7 @@ from langchain.schema import BaseRetriever
 
 # Adapter that is pydantic-friendly for LangChain
 # --- Replace your current SimpleRetrieverAdapter with this improved version ---
+# --- Replace your current SimpleRetrieverAdapter with this updated version ---
 from langchain.schema import BaseRetriever
 import numpy as np
 
@@ -178,7 +179,7 @@ class SimpleRetrieverAdapter(BaseRetriever):
      - is pydantic-friendly (model_config)
      - proxies unknown attrs to the inner simple retriever
      - provides async wrapper and an optional scored-retrieval method
-     - exposes a `tags` attribute to satisfy callers that expect it
+     - exposes `tags` and `metadata` attributes to satisfy callers
     """
     model_config = {"extra": "allow"}
 
@@ -187,6 +188,8 @@ class SimpleRetrieverAdapter(BaseRetriever):
         object.__setattr__(self, "simple", simple_retriever)
         # expose a tags field (empty by default)
         object.__setattr__(self, "tags", [])
+        # expose metadata field (empty dict by default)
+        object.__setattr__(self, "metadata", {})
 
     def __getattr__(self, name):
         # proxy unknown attributes/methods to the wrapped retriever
@@ -207,7 +210,6 @@ class SimpleRetrieverAdapter(BaseRetriever):
         If the wrapped SimpleRetriever has vectors/docs/embeddings we compute cosine scores.
         Otherwise, fall back to returning (doc, 1.0).
         """
-        # prefer to compute accurate scores if possible
         if hasattr(self.simple, "vectors") and hasattr(self.simple, "docs") and hasattr(self.simple, "embeddings"):
             # embed query
             try:
@@ -220,15 +222,12 @@ class SimpleRetrieverAdapter(BaseRetriever):
                 qvec = np.array(embeddings.embed_documents([query]))[0]
 
             vecs = self.simple.vectors  # numpy array
-            # cosine similarities
             denom = (np.linalg.norm(vecs, axis=1) * (np.linalg.norm(qvec) + 1e-12)) + 1e-12
             sims = np.dot(vecs, qvec) / denom
             sims = np.nan_to_num(sims)
-            # top-k indices
             topk_idxs = sims.argsort()[::-1][: self.simple.k if hasattr(self.simple, "k") else sims.shape[0]]
             return [(self.simple.docs[i], float(sims[i])) for i in topk_idxs]
         else:
-            # fallback: return docs with score 1.0
             docs = self.simple.get_relevant_documents(query)
             return [(d, 1.0) for d in docs]
 
