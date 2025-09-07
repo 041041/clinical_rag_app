@@ -171,6 +171,7 @@ from langchain.schema import BaseRetriever
 # --- Replace your current SimpleRetrieverAdapter with this improved version ---
 # --- Replace your current SimpleRetrieverAdapter with this updated version ---
 # ---------- Replace your current SimpleRetrieverAdapter with this updated class ----------
+# ----------------- Paste this class (replace older adapter) -----------------
 from langchain.schema import BaseRetriever
 import numpy as np
 from typing import List
@@ -178,47 +179,49 @@ from langchain.docstore.document import Document
 
 class SimpleRetrieverAdapter(BaseRetriever):
     """
-    LangChain-friendly adapter around our SimpleRetriever.
-    Implements the new recommended abstract methods:
-      - _get_relevant_documents(self, query: str) -> List[Document]
-      - _aget_relevant_documents(self, query: str) -> List[Document]
-    Also keeps backward-compatible get_relevant_documents / aget_relevant_documents.
-    Exposes 'tags' and 'metadata' attributes and proxies unknown attributes to the inner retriever.
+    Robust LangChain adapter for our SimpleRetriever.
+    Implements LangChain's new protected API and avoids recursion in __getattr__.
     """
-    # allow pydantic to accept extra attributes
     model_config = {"extra": "allow"}
 
     def __init__(self, simple_retriever):
-        # store wrapped retriever without pydantic validation
+        # Store wrapped retriever without pydantic validation
         object.__setattr__(self, "simple", simple_retriever)
         object.__setattr__(self, "tags", [])
         object.__setattr__(self, "metadata", {})
 
-    # Proxy unknown attributes to underlying simple retriever
     def __getattr__(self, name):
+        """
+        Proxy unknown attributes to the inner retriever.
+        Use object.__getattribute__ to avoid reentering __getattr__.
+        """
         try:
-            return getattr(self.simple, name)
+            simple = object.__getattribute__(self, "simple")
+        except Exception:
+            raise AttributeError(f"{self.__class__.__name__} has no attribute {name}")
+
+        # Proxy to underlying simple retriever if attribute exists there
+        try:
+            return getattr(simple, name)
         except AttributeError:
             raise AttributeError(f"{self.__class__.__name__} has no attribute {name}")
 
-    # New synchronous method LangChain expects
+    # New protected sync method required by LangChain
     def _get_relevant_documents(self, query: str) -> List[Document]:
-        # call underlying simple retriever
         return self.simple.get_relevant_documents(query)
 
-    # New async method LangChain expects
+    # New protected async method required by LangChain
     async def _aget_relevant_documents(self, query: str) -> List[Document]:
-        # run sync version (SimpleRetriever is synchronous); return same list
         return self._get_relevant_documents(query)
 
-    # Keep the older public-facing synonyms for compatibility
+    # Backwards-compatible public methods
     def get_relevant_documents(self, query: str) -> List[Document]:
         return self._get_relevant_documents(query)
 
     async def aget_relevant_documents(self, query: str) -> List[Document]:
         return await self._aget_relevant_documents(query)
 
-    # Optional helper returning (Document, score) pairs
+    # Optional: return docs with similarity scores
     def get_relevant_documents_with_score(self, query: str):
         if hasattr(self.simple, "vectors") and hasattr(self.simple, "docs") and hasattr(self.simple, "embeddings"):
             embeddings = self.simple.embeddings
@@ -239,6 +242,8 @@ class SimpleRetrieverAdapter(BaseRetriever):
         else:
             docs = self.simple.get_relevant_documents(query)
             return [(d, 1.0) for d in docs]
+# ---------------------------------------------------------------------------
+
 # ---------------------------------------------------------------------------------------
 
 # -------------------------
