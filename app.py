@@ -170,50 +170,59 @@ from langchain.schema import BaseRetriever
 # Adapter that is pydantic-friendly for LangChain
 # --- Replace your current SimpleRetrieverAdapter with this improved version ---
 # --- Replace your current SimpleRetrieverAdapter with this updated version ---
+# ---------- Replace your current SimpleRetrieverAdapter with this updated class ----------
 from langchain.schema import BaseRetriever
 import numpy as np
+from typing import List
+from langchain.docstore.document import Document
 
 class SimpleRetrieverAdapter(BaseRetriever):
     """
-    Adapter that wraps SimpleRetriever and:
-     - is pydantic-friendly (model_config)
-     - proxies unknown attrs to the inner simple retriever
-     - provides async wrapper and an optional scored-retrieval method
-     - exposes `tags` and `metadata` attributes to satisfy callers
+    LangChain-friendly adapter around our SimpleRetriever.
+    Implements the new recommended abstract methods:
+      - _get_relevant_documents(self, query: str) -> List[Document]
+      - _aget_relevant_documents(self, query: str) -> List[Document]
+    Also keeps backward-compatible get_relevant_documents / aget_relevant_documents.
+    Exposes 'tags' and 'metadata' attributes and proxies unknown attributes to the inner retriever.
     """
+    # allow pydantic to accept extra attributes
     model_config = {"extra": "allow"}
 
     def __init__(self, simple_retriever):
-        # store the wrapped retriever without pydantic validation
+        # store wrapped retriever without pydantic validation
         object.__setattr__(self, "simple", simple_retriever)
-        # expose a tags field (empty by default)
         object.__setattr__(self, "tags", [])
-        # expose metadata field (empty dict by default)
         object.__setattr__(self, "metadata", {})
 
+    # Proxy unknown attributes to underlying simple retriever
     def __getattr__(self, name):
-        # proxy unknown attributes/methods to the wrapped retriever
         try:
             return getattr(self.simple, name)
         except AttributeError:
             raise AttributeError(f"{self.__class__.__name__} has no attribute {name}")
 
-    def get_relevant_documents(self, query: str):
+    # New synchronous method LangChain expects
+    def _get_relevant_documents(self, query: str) -> List[Document]:
+        # call underlying simple retriever
         return self.simple.get_relevant_documents(query)
 
-    async def aget_relevant_documents(self, query: str):
-        return self.get_relevant_documents(query)
+    # New async method LangChain expects
+    async def _aget_relevant_documents(self, query: str) -> List[Document]:
+        # run sync version (SimpleRetriever is synchronous); return same list
+        return self._get_relevant_documents(query)
 
+    # Keep the older public-facing synonyms for compatibility
+    def get_relevant_documents(self, query: str) -> List[Document]:
+        return self._get_relevant_documents(query)
+
+    async def aget_relevant_documents(self, query: str) -> List[Document]:
+        return await self._aget_relevant_documents(query)
+
+    # Optional helper returning (Document, score) pairs
     def get_relevant_documents_with_score(self, query: str):
-        """
-        Optional helper returning list of (Document, score).
-        If the wrapped SimpleRetriever has vectors/docs/embeddings we compute cosine scores.
-        Otherwise, fall back to returning (doc, 1.0).
-        """
         if hasattr(self.simple, "vectors") and hasattr(self.simple, "docs") and hasattr(self.simple, "embeddings"):
-            # embed query
+            embeddings = self.simple.embeddings
             try:
-                embeddings = self.simple.embeddings
                 if hasattr(embeddings, "embed_query"):
                     qvec = np.array(embeddings.embed_query(query))
                 else:
@@ -221,7 +230,7 @@ class SimpleRetrieverAdapter(BaseRetriever):
             except Exception:
                 qvec = np.array(embeddings.embed_documents([query]))[0]
 
-            vecs = self.simple.vectors  # numpy array
+            vecs = self.simple.vectors
             denom = (np.linalg.norm(vecs, axis=1) * (np.linalg.norm(qvec) + 1e-12)) + 1e-12
             sims = np.dot(vecs, qvec) / denom
             sims = np.nan_to_num(sims)
@@ -230,6 +239,7 @@ class SimpleRetrieverAdapter(BaseRetriever):
         else:
             docs = self.simple.get_relevant_documents(query)
             return [(d, 1.0) for d in docs]
+# ---------------------------------------------------------------------------------------
 
 # -------------------------
 # Build / load simple index
