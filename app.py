@@ -172,56 +172,53 @@ from langchain.schema import BaseRetriever
 # --- Replace your current SimpleRetrieverAdapter with this updated version ---
 # ---------- Replace your current SimpleRetrieverAdapter with this updated class ----------
 # ----------------- Paste this class (replace older adapter) -----------------
+# ---- Paste this adapter into app.py (replace previous SimpleRetrieverAdapter) ----
 from langchain.schema import BaseRetriever
 import numpy as np
-from typing import List
+from typing import List, Any
 from langchain.docstore.document import Document
 
 class SimpleRetrieverAdapter(BaseRetriever):
     """
-    Robust LangChain adapter for our SimpleRetriever.
-    Implements LangChain's new protected API and avoids recursion in __getattr__.
+    Robust adapter implementing both new protected methods and legacy public methods.
+    Uses object.__getattribute__ in __getattr__ to avoid recursion.
+    Accepts *args/**kwargs in protected methods to be compatible across LangChain versions.
     """
     model_config = {"extra": "allow"}
 
     def __init__(self, simple_retriever):
-        # Store wrapped retriever without pydantic validation
+        # store wrapped retriever without pydantic validation
         object.__setattr__(self, "simple", simple_retriever)
         object.__setattr__(self, "tags", [])
         object.__setattr__(self, "metadata", {})
 
-    def __getattr__(self, name):
-        """
-        Proxy unknown attributes to the inner retriever.
-        Use object.__getattribute__ to avoid reentering __getattr__.
-        """
+    def __getattr__(self, name: str) -> Any:
+        # proxy unknown attributes to the wrapped simple retriever
         try:
             simple = object.__getattribute__(self, "simple")
         except Exception:
             raise AttributeError(f"{self.__class__.__name__} has no attribute {name}")
-
-        # Proxy to underlying simple retriever if attribute exists there
         try:
             return getattr(simple, name)
         except AttributeError:
             raise AttributeError(f"{self.__class__.__name__} has no attribute {name}")
 
-    # New protected sync method required by LangChain
-    def _get_relevant_documents(self, query: str) -> List[Document]:
+    # New protected sync method LangChain expects; accept *args/**kwargs for compatibility
+    def _get_relevant_documents(self, query: str, *args, **kwargs) -> List[Document]:
         return self.simple.get_relevant_documents(query)
 
-    # New protected async method required by LangChain
-    async def _aget_relevant_documents(self, query: str) -> List[Document]:
+    # New protected async method LangChain expects; accept *args/**kwargs for compatibility
+    async def _aget_relevant_documents(self, query: str, *args, **kwargs) -> List[Document]:
         return self._get_relevant_documents(query)
 
-    # Backwards-compatible public methods
-    def get_relevant_documents(self, query: str) -> List[Document]:
-        return self._get_relevant_documents(query)
+    # Backward-compatible public API, also permissive
+    def get_relevant_documents(self, query: str, *args, **kwargs) -> List[Document]:
+        return self._get_relevant_documents(query, *args, **kwargs)
 
-    async def aget_relevant_documents(self, query: str) -> List[Document]:
-        return await self._aget_relevant_documents(query)
+    async def aget_relevant_documents(self, query: str, *args, **kwargs) -> List[Document]:
+        return await self._aget_relevant_documents(query, *args, **kwargs)
 
-    # Optional: return docs with similarity scores
+    # Optional helper returning (Document, score) pairs (unchanged)
     def get_relevant_documents_with_score(self, query: str):
         if hasattr(self.simple, "vectors") and hasattr(self.simple, "docs") and hasattr(self.simple, "embeddings"):
             embeddings = self.simple.embeddings
@@ -242,6 +239,8 @@ class SimpleRetrieverAdapter(BaseRetriever):
         else:
             docs = self.simple.get_relevant_documents(query)
             return [(d, 1.0) for d in docs]
+# -----------------------------------------------------------------------------------
+
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------------------
