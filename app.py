@@ -177,41 +177,68 @@ class SimpleRetriever:
         return [self.docs[i] for i in topk_idx]
 
 # ----------------- Adapter for LangChain compatibility (safe) -----------------
+# --- Replace your current SimpleRetrieverAdapter with this updated version ---
 from langchain.schema import BaseRetriever
+import numpy as np
 
 class SimpleRetrieverAdapter(BaseRetriever):
     """
-    Adapter compatible with multiple LangChain versions.
-    Implements both protected (_get_relevant_documents) and legacy public methods.
+    Adapter that wraps SimpleRetriever and:
+     - is pydantic-friendly (model_config)
+     - proxies unknown attrs to the inner simple retriever
+     - provides async wrapper and an optional scored-retrieval method
+     - exposes `tags` and `metadata` attributes to satisfy callers
     """
     model_config = {"extra": "allow"}
 
-    def __init__(self, simple_retriever: SimpleRetriever):
+    def __init__(self, simple_retriever):
+        # store the wrapped retriever without pydantic validation
         object.__setattr__(self, "simple", simple_retriever)
+        # expose a tags field (empty by default)
         object.__setattr__(self, "tags", [])
+        # expose metadata field (empty dict by default)
         object.__setattr__(self, "metadata", {})
 
-    def __getattr__(self, name: str) -> Any:
+    def __getattr__(self, name):
+        # proxy unknown attributes/methods to the wrapped retriever
         try:
-            simple = object.__getattribute__(self, "simple")
-        except Exception:
-            raise AttributeError(f"{self.__class__.__name__} has no attribute {name}")
-        try:
-            return getattr(simple, name)
+            return getattr(self.simple, name)
         except AttributeError:
             raise AttributeError(f"{self.__class__.__name__} has no attribute {name}")
 
-    def _get_relevant_documents(self, query: str, *args, **kwargs) -> List[Document]:
+    def get_relevant_documents(self, query: str):
         return self.simple.get_relevant_documents(query)
 
-    async def _aget_relevant_documents(self, query: str, *args, **kwargs) -> List[Document]:
-        return self._get_relevant_documents(query, *args, **kwargs)
+    async def aget_relevant_documents(self, query: str):
+        return self.get_relevant_documents(query)
 
-    def get_relevant_documents(self, query: str, *args, **kwargs) -> List[Document]:
-        return self._get_relevant_documents(query, *args, **kwargs)
+    def get_relevant_documents_with_score(self, query: str):
+        """
+        Optional helper returning list of (Document, score).
+        If the wrapped SimpleRetriever has vectors/docs/embeddings we compute cosine scores.
+        Otherwise, fall back to returning (doc, 1.0).
+        """
+        if hasattr(self.simple, "vectors") and hasattr(self.simple, "docs") and hasattr(self.simple, "embeddings"):
+            # embed query
+            try:
+                embeddings = self.simple.embeddings
+                if hasattr(embeddings, "embed_query"):
+                    qvec = np.array(embeddings.embed_query(query))
+                else:
+                    qvec = np.array(embeddings.embed_documents([query]))[0]
+            except Exception:
+                qvec = np.array(embeddings.embed_documents([query]))[0]
 
-    async def aget_relevant_documents(self, query: str, *args, **kwargs) -> List[Document]:
-        return await self._aget_relevant_documents(query, *args, **kwargs)
+            vecs = self.simple.vectors  # numpy array
+            denom = (np.linalg.norm(vecs, axis=1) * (np.linalg.norm(qvec) + 1e-12)) + 1e-12
+            sims = np.dot(vecs, qvec) / denom
+            sims = np.nan_to_num(sims)
+            topk_idxs = sims.argsort()[::-1][: self.simple.k if hasattr(self.simple, "k") else sims.shape[0]]
+            return [(self.simple.docs[i], float(sims[i])) for i in topk_idxs]
+        else:
+            docs = self.simple.get_relevant_documents(query)
+            return [(d, 1.0) for d in docs]
+
 
 # ----------------- Core indexing / loading pipeline -----------------
 def build_index_for_user(user_folder: Path):
