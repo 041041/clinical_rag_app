@@ -164,22 +164,67 @@ class SimpleRetriever:
 
 # Adapter so our SimpleRetriever looks like a LangChain BaseRetriever
 # Adapter that is pydantic-friendly for LangChain
+# --- Replace your current SimpleRetrieverAdapter with this updated version ---
 from langchain.schema import BaseRetriever
+import numpy as np
 
 class SimpleRetrieverAdapter(BaseRetriever):
-    # allow arbitrary extra attributes (pydantic v2 style)
+    """
+    Adapter that wraps SimpleRetriever and:
+     - is pydantic-friendly (model_config)
+     - proxies unknown attrs to the inner simple retriever
+     - provides async wrapper and an optional scored-retrieval method
+     - exposes `tags` and `metadata` attributes to satisfy callers
+    """
     model_config = {"extra": "allow"}
 
     def __init__(self, simple_retriever):
-        # use object.__setattr__ to bypass pydantic validation for this internal field
+        # store the wrapped retriever without pydantic validation
         object.__setattr__(self, "simple", simple_retriever)
+        # expose a tags field (empty by default)
+        object.__setattr__(self, "tags", [])
+        # expose metadata field (empty dict by default)
+        object.__setattr__(self, "metadata", {})
+
+    def __getattr__(self, name):
+        # proxy unknown attributes/methods to the wrapped retriever
+        try:
+            return getattr(self.simple, name)
+        except AttributeError:
+            raise AttributeError(f"{self.__class__.__name__} has no attribute {name}")
 
     def get_relevant_documents(self, query: str):
         return self.simple.get_relevant_documents(query)
 
     async def aget_relevant_documents(self, query: str):
-        # async wrapper in case LangChain calls this
         return self.get_relevant_documents(query)
+
+    def get_relevant_documents_with_score(self, query: str):
+        """
+        Optional helper returning list of (Document, score).
+        If the wrapped SimpleRetriever has vectors/docs/embeddings we compute cosine scores.
+        Otherwise, fall back to returning (doc, 1.0).
+        """
+        if hasattr(self.simple, "vectors") and hasattr(self.simple, "docs") and hasattr(self.simple, "embeddings"):
+            # embed query
+            try:
+                embeddings = self.simple.embeddings
+                if hasattr(embeddings, "embed_query"):
+                    qvec = np.array(embeddings.embed_query(query))
+                else:
+                    qvec = np.array(embeddings.embed_documents([query]))[0]
+            except Exception:
+                qvec = np.array(embeddings.embed_documents([query]))[0]
+
+            vecs = self.simple.vectors  # numpy array
+            denom = (np.linalg.norm(vecs, axis=1) * (np.linalg.norm(qvec) + 1e-12)) + 1e-12
+            sims = np.dot(vecs, qvec) / denom
+            sims = np.nan_to_num(sims)
+            topk_idxs = sims.argsort()[::-1][: self.simple.k if hasattr(self.simple, "k") else sims.shape[0]]
+            return [(self.simple.docs[i], float(sims[i])) for i in topk_idxs]
+        else:
+            docs = self.simple.get_relevant_documents(query)
+            return [(d, 1.0) for d in docs]
 
 
 
