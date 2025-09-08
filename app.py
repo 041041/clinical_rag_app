@@ -163,19 +163,24 @@ class SimpleRetriever:
         return docs_out
 
 # Adapter so our SimpleRetriever looks like a LangChain BaseRetriever
+# Adapter that is pydantic-friendly for LangChain
+from langchain.schema import BaseRetriever
+
 class SimpleRetrieverAdapter(BaseRetriever):
-    """Wraps the SimpleRetriever to satisfy LangChain's BaseRetriever type checks."""
+    # allow arbitrary extra attributes (pydantic v2 style)
+    model_config = {"extra": "allow"}
 
     def __init__(self, simple_retriever):
-        self.simple = simple_retriever
+        # use object.__setattr__ to bypass pydantic validation for this internal field
+        object.__setattr__(self, "simple", simple_retriever)
 
     def get_relevant_documents(self, query: str):
-        # synchronous wrapper
         return self.simple.get_relevant_documents(query)
 
     async def aget_relevant_documents(self, query: str):
-        # asynchronous wrapper (LangChain may call this)
+        # async wrapper in case LangChain calls this
         return self.get_relevant_documents(query)
+
 
 
 # -------------------------
@@ -225,6 +230,10 @@ PROMPT_TEMPLATE_STR = (
 prompt_template = PromptTemplate(input_variables=["question", "context"], template=PROMPT_TEMPLATE_STR)
 
 def create_qa_from_retriever(retriever):
+    """
+    Accepts our SimpleRetriever (or SimpleRetrieverAdapter) and returns a LangChain RetrievalQA.
+    We wrap the simple retriever in SimpleRetrieverAdapter so pydantic validation succeeds.
+    """
     wrapped = SimpleRetrieverAdapter(retriever)
     qa = RetrievalQA.from_chain_type(
         llm=ChatGoogleGenerativeAI(model=LLM_MODEL, temperature=0.2, max_output_tokens=1024),
@@ -233,6 +242,7 @@ def create_qa_from_retriever(retriever):
         chain_type_kwargs={"prompt": prompt_template},
     )
     return qa
+
 
 
 # -------------------------
