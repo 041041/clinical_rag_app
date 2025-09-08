@@ -36,6 +36,8 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGener
 # LangChain chain & prompt
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
+from langchain.schema import BaseRetriever  # add near other imports
+
 
 # -------------------------
 # CONFIG
@@ -160,6 +162,22 @@ class SimpleRetriever:
         docs_out = [self.docs[i] for i in topk]
         return docs_out
 
+# Adapter so our SimpleRetriever looks like a LangChain BaseRetriever
+class SimpleRetrieverAdapter(BaseRetriever):
+    """Wraps the SimpleRetriever to satisfy LangChain's BaseRetriever type checks."""
+
+    def __init__(self, simple_retriever):
+        self.simple = simple_retriever
+
+    def get_relevant_documents(self, query: str):
+        # synchronous wrapper
+        return self.simple.get_relevant_documents(query)
+
+    async def aget_relevant_documents(self, query: str):
+        # asynchronous wrapper (LangChain may call this)
+        return self.get_relevant_documents(query)
+
+
 # -------------------------
 # Build / load simple index
 # -------------------------
@@ -207,14 +225,15 @@ PROMPT_TEMPLATE_STR = (
 prompt_template = PromptTemplate(input_variables=["question", "context"], template=PROMPT_TEMPLATE_STR)
 
 def create_qa_from_retriever(retriever):
-    # build RetrievalQA from retriever (our retriever implements get_relevant_documents)
+    wrapped = SimpleRetrieverAdapter(retriever)
     qa = RetrievalQA.from_chain_type(
         llm=ChatGoogleGenerativeAI(model=LLM_MODEL, temperature=0.2, max_output_tokens=1024),
-        retriever=retriever,
+        retriever=wrapped,
         return_source_documents=True,
         chain_type_kwargs={"prompt": prompt_template},
     )
     return qa
+
 
 # -------------------------
 # Streamlit UI
