@@ -37,6 +37,8 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGener
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 from langchain.schema import BaseRetriever  # add near other imports
+from sentence_transformers import SentenceTransformer
+
 
 
 # -------------------------
@@ -44,7 +46,7 @@ from langchain.schema import BaseRetriever  # add near other imports
 # -------------------------
 BASE_DATA_DIR = Path("data")
 INDEX_SUBDIR = "rag_index"
-EMBED_MODEL = "models/embedding-001"
+EMBED_MODEL = "all-MiniLM-L6-v2"
 LLM_MODEL = "gemini-1.5-flash"
 RETRIEVER_K = 8
 CHUNK_SIZE = 800
