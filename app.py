@@ -31,7 +31,8 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.docstore.document import Document
 
 # embeddings / LLM
-from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+from langchain_google_genai import ChatGoogleGenerativeAI
+
 
 # LangChain chain & prompt
 from langchain.chains import RetrievalQA
@@ -51,6 +52,9 @@ LLM_MODEL = "gemini-1.5-flash"
 RETRIEVER_K = 8
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 150
+
+from langchain_huggingface import HuggingFaceEmbeddings
+embeddings = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
 
 # files inside index folder
 VECTORS_FILE = "vectors.npy"
