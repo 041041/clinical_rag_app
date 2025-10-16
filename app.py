@@ -54,7 +54,7 @@ CHUNK_SIZE = 800
 CHUNK_OVERLAP = 150
 
 from langchain_huggingface import HuggingFaceEmbeddings
-embeddings = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
+
 
 # files inside index folder
 VECTORS_FILE = "vectors.npy"
@@ -245,7 +245,7 @@ def build_simple_index(data_folder: Path, index_folder: Path):
                                              separators=["\n\n", "\n", " ", ""])
     chunks = splitter.split_documents(docs)
 
-    embeddings = GoogleGenerativeAIEmbeddings(model=EMBED_MODEL)
+    embeddings = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
 
     texts = [d.page_content for d in chunks]
     # embed documents (may be expensive)
@@ -264,7 +264,7 @@ def build_simple_index(data_folder: Path, index_folder: Path):
 def load_or_build_simple_index_for_user(user_folder: Path):
     index_path = user_folder / INDEX_SUBDIR
     vectors, docs = load_simple_index(index_path)
-    embeddings = GoogleGenerativeAIEmbeddings(model=EMBED_MODEL)
+    embeddings = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
     if vectors is not None and docs is not None:
         return SimpleRetriever(vectors=vectors, docs=docs, embeddings=embeddings, k=RETRIEVER_K)
     # else build
