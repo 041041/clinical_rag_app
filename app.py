@@ -48,7 +48,7 @@ from sentence_transformers import SentenceTransformer
 BASE_DATA_DIR = Path("data")
 INDEX_SUBDIR = "rag_index"
 EMBED_MODEL = "all-MiniLM-L6-v2"
-LLM_MODEL = "gemini-1.5-flash"
+LLM_MODEL = "gemini-2.5-flash"
 RETRIEVER_K = 8
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 150
