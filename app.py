@@ -623,47 +623,99 @@ def _extract_text_from_llm_response(raw):
 def _call_chain_safe(qa_chain, query: str):
     """
     Try common invocation methods and normalize output:
-      returns {"result": str, "source_documents": [Document, ...], "raw": raw}
+    returns {"result": str, "source_documents": [Document, ...], "raw": raw}
+    This version includes aggressive defensive checks and returns raw for debugging.
     """
     call_methods = ["invoke", "run", "__call__", "predict", "generate"]
     last_err = None
+    last_raw = None
+
     for m in call_methods:
         fn = getattr(qa_chain, m, None)
         if not fn:
             continue
         try:
-            # try dictionary input first for methods that expect it
-            if m in ("invoke",):
+            # call the function using the most likely argument shape
+            if m == "invoke":
                 raw = fn({"query": query})
             else:
-                # some .run accept string, some expect dict — we try string
+                # try raw string first, fall back to dict if TypeError
                 try:
                     raw = fn(query)
                 except TypeError:
                     raw = fn({"query": query})
+            last_raw = raw
 
-            # If raw is a dict and contains source_documents already, reuse
-            source_documents = []
-            if isinstance(raw, dict) and "source_documents" in raw:
-                source_documents = raw.get("source_documents") or []
-                text_candidate, _ = _extract_text_from_llm_response(raw)
-            else:
-                # normalize through extractor
-                text_candidate, raw_saved = _extract_text_from_llm_response(raw)
-                # try to pull source_documents from .source_documents attribute
-                if hasattr(raw, "source_documents"):
-                    source_documents = getattr(raw, "source_documents") or []
-                elif isinstance(raw, dict) and "documents" in raw:
-                    source_documents = raw.get("documents") or []
+            # If raw is dict and already contains text + sources, use it
+            if isinstance(raw, dict):
+                # attempt common key names for text
+                for k in ("result", "text", "content", "message", "output", "response"):
+                    if k in raw and isinstance(raw[k], str):
+                        return {"result": raw[k], "source_documents": raw.get("source_documents", []) or raw.get("documents", []), "raw": raw}
+                # nested candidates shape
+                if "candidates" in raw and isinstance(raw["candidates"], (list, tuple)) and raw["candidates"]:
+                    c0 = raw["candidates"][0]
+                    if isinstance(c0, str):
+                        return {"result": c0, "source_documents": raw.get("source_documents", []) or raw.get("documents", []), "raw": raw}
+                    if isinstance(c0, dict) and "content" in c0 and isinstance(c0["content"], str):
+                        return {"result": c0["content"], "source_documents": raw.get("source_documents", []) or raw.get("documents", []), "raw": raw}
 
-            return {"result": text_candidate, "source_documents": source_documents, "raw": raw}
+            # If it's a string, return directly
+            if isinstance(raw, str):
+                return {"result": raw, "source_documents": [], "raw": raw}
+
+            # LangChain-like Generations objects
+            try:
+                if hasattr(raw, "generations"):
+                    gens = getattr(raw, "generations")
+                    if gens:
+                        # try extract text safely
+                        g0 = gens[0]
+                        # sometimes list-of-lists
+                        if isinstance(g0, list) and g0:
+                            candidate = g0[0]
+                        else:
+                            candidate = g0
+                        # try multiple attribute names without assuming their existence
+                        for attr in ("text", "content", "message"):
+                            if hasattr(candidate, attr):
+                                val = getattr(candidate, attr)
+                                # if val is string
+                                if isinstance(val, str):
+                                    return {"result": val, "source_documents": getattr(raw, "source_documents", []) or [], "raw": raw}
+                                # if val has .content nested
+                                if hasattr(val, "content") and isinstance(getattr(val, "content"), str):
+                                    return {"result": getattr(val, "content"), "source_documents": getattr(raw, "source_documents", []) or [], "raw": raw}
+            except Exception:
+                # swallow extraction exceptions and continue to generic fallbacks
+                pass
+
+            # If object has source_documents attribute, attempt to stringify anything we can find
+            source_docs = getattr(raw, "source_documents", None) or (raw.get("source_documents") if isinstance(raw, dict) else None) or []
+            # final best-effort text extraction:
+            text_candidates = []
+            # check common attrs
+            for attr in ("text", "content", "message", "result"):
+                if hasattr(raw, attr):
+                    val = getattr(raw, attr)
+                    if isinstance(val, str):
+                        text_candidates.append(val)
+                    elif hasattr(val, "content") and isinstance(getattr(val, "content"), str):
+                        text_candidates.append(getattr(val, "content"))
+            if text_candidates:
+                return {"result": text_candidates[0], "source_documents": source_docs or [], "raw": raw}
+
+            # fallback: stringify the raw object safely
+            return {"result": str(raw), "source_documents": source_docs or [], "raw": raw}
 
         except Exception as e:
             last_err = e
             continue
 
-    # nothing worked
-    raise RuntimeError(f"Could not invoke QA chain - last error: {last_err}")
+    # nothing worked — raise with helpful debug info
+    debug_raw_repr = repr(last_raw) if last_raw is not None else "<no raw captured>"
+    debug_raw_type = type(last_raw).__name__ if last_raw is not None else "None"
+    raise RuntimeError(f"Could not invoke QA chain - last error: {last_err} | last_raw_type: {debug_raw_type} | last_raw_preview: {debug_raw_repr[:1000]}")
 
 
 # -------------------------
@@ -758,17 +810,44 @@ def query_with_features(qa_chain, query: str):
 
         except Exception as e:
             last_error = e
+            # if the _call_chain_safe included raw preview in the message, show it immediately on final attempt
             if attempt < max_retries - 1:
                 wait_time = 2 ** attempt  # Exponential backoff
                 st.warning(f"⚠️ Attempt {attempt + 1} failed. Retrying in {wait_time}s...")
                 time.sleep(wait_time)
+                continue
             else:
                 elapsed = time.time() - start_time
                 metrics.log_query(query, elapsed, error=True)
-                st.error(f"❌ All retries failed: {last_error}")
+                # surface the raw debug info (if present) and the exception
+                err_str = str(e)
+                # try to parse useful debug fields if they were embedded in the exception message
+                debug_hint = ""
+                try:
+                    # if our RuntimeError included last_raw_type / last_raw_preview, show them
+                    if "last_raw_type" in err_str or "last_raw_preview" in err_str:
+                        debug_hint = "\n\nDebug info from chain:\n" + err_str
+                except Exception:
+                    debug_hint = f"\n\nException repr: {repr(e)}"
+
+                st.error(f"❌ All retries failed: {err_str}{debug_hint}")
+                # also print to logs so you can copy+pate here
+                st.write("----\n**Debug (copy this and paste in chat):**")
+                st.write("Exception:", repr(e))
+                # If the exception text contains a preview of raw, display it as code
+                try:
+                    # split and show preview substring if exists
+                    if "last_raw_preview" in err_str:
+                        # show the preview substring after 'last_raw_preview: '
+                        preview = err_str.split("last_raw_preview: ", 1)[-1]
+                        st.code(preview[:5000])
+                except Exception:
+                    pass
+
                 return None, False, elapsed
 
     return None, False, time.time() - start_time
+
 
 
 # -------------------------
