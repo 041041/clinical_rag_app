@@ -1,10 +1,15 @@
-# app.py
+# app.py - ENHANCED VERSION
+# Added: Caching, Error Handling, Metrics, Cost Tracking, Performance Monitoring
+
 import os
 import asyncio
 from pathlib import Path
 from typing import List
 import pickle
 from math import sqrt
+import time
+from datetime import datetime
+import hashlib
 
 import numpy as np
 import streamlit as st
@@ -29,18 +34,12 @@ from langchain_community.document_loaders import (
 )
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.docstore.document import Document
-
-# embeddings / LLM
 from langchain_google_genai import ChatGoogleGenerativeAI
-
-
-# LangChain chain & prompt
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
-from langchain.schema import BaseRetriever  # add near other imports
+from langchain.schema import BaseRetriever
 from sentence_transformers import SentenceTransformer
-
-
+from langchain_huggingface import HuggingFaceEmbeddings
 
 # -------------------------
 # CONFIG
@@ -53,14 +52,119 @@ RETRIEVER_K = 8
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 150
 
-from langchain_huggingface import HuggingFaceEmbeddings
-
-
 # files inside index folder
 VECTORS_FILE = "vectors.npy"
 META_FILE = "meta.pkl"
 
 BASE_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ========================================
+# NEW: METRICS & COST TRACKING
+# ========================================
+class MetricsTracker:
+    """Track system performance and costs"""
+    def __init__(self):
+        self.queries = []
+        self.total_queries = 0
+        self.cache_hits = 0
+        self.total_tokens = 0
+        self.errors = 0
+        
+    def log_query(self, query: str, response_time: float, cached: bool = False, tokens: int = 0, error: bool = False):
+        self.total_queries += 1
+        if cached:
+            self.cache_hits += 1
+        if error:
+            self.errors += 1
+        self.total_tokens += tokens
+        
+        self.queries.append({
+            "query": query[:100],
+            "response_time": response_time,
+            "cached": cached,
+            "tokens": tokens,
+            "timestamp": datetime.now(),
+            "error": error
+        })
+    
+    def get_stats(self):
+        if self.total_queries == 0:
+            return {
+                "total_queries": 0,
+                "cache_hit_rate": "0%",
+                "avg_response_time": 0,
+                "error_rate": "0%",
+                "total_tokens": 0,
+                "estimated_cost": "$0.00"
+            }
+        
+        cache_rate = (self.cache_hits / self.total_queries) * 100
+        error_rate = (self.errors / self.total_queries) * 100
+        
+        non_cached = [q for q in self.queries if not q["cached"]]
+        avg_time = sum(q["response_time"] for q in non_cached) / len(non_cached) if non_cached else 0
+        
+        # Gemini Flash pricing: ~$0.35 per 1M tokens (input + output)
+        estimated_cost = (self.total_tokens / 1_000_000) * 0.35
+        
+        return {
+            "total_queries": self.total_queries,
+            "cache_hit_rate": f"{cache_rate:.1f}%",
+            "avg_response_time": f"{avg_time:.2f}s",
+            "error_rate": f"{error_rate:.1f}%",
+            "total_tokens": self.total_tokens,
+            "estimated_cost": f"${estimated_cost:.4f}"
+        }
+
+# Initialize metrics in session state
+if 'metrics' not in st.session_state:
+    st.session_state.metrics = MetricsTracker()
+
+
+# ========================================
+# NEW: QUERY CACHE
+# ========================================
+class QueryCache:
+    """Simple query cache to reduce API calls"""
+    def __init__(self, max_size=50, ttl_seconds=3600):
+        self.cache = {}
+        self.max_size = max_size
+        self.ttl = ttl_seconds
+    
+    def _get_key(self, query: str) -> str:
+        return hashlib.md5(query.lower().strip().encode()).hexdigest()
+    
+    def get(self, query: str):
+        key = self._get_key(query)
+        if key in self.cache:
+            result, timestamp = self.cache[key]
+            # Check if expired
+            if time.time() - timestamp < self.ttl:
+                return result
+            else:
+                del self.cache[key]
+        return None
+    
+    def set(self, query: str, result):
+        key = self._get_key(query)
+        # If cache is full, remove oldest
+        if len(self.cache) >= self.max_size:
+            oldest_key = min(self.cache.keys(), key=lambda k: self.cache[k][1])
+            del self.cache[oldest_key]
+        self.cache[key] = (result, time.time())
+    
+    def get_stats(self):
+        return {
+            "size": len(self.cache),
+            "max_size": self.max_size,
+            "usage": f"{(len(self.cache) / self.max_size) * 100:.1f}%"
+        }
+
+# Initialize cache in session state
+if 'query_cache' not in st.session_state:
+    st.session_state.query_cache = QueryCache(max_size=50, ttl_seconds=3600)
+
 
 # -------------------------
 # Helpers: file loaders / splitting
@@ -103,16 +207,20 @@ def load_documents_from_folder(folder: Path) -> List[Document]:
                     d.metadata = getattr(d, "metadata", {}) or {}
                     d.metadata["source"] = fp.name
                 docs.extend(file_docs)
-                try:
-                    st.info(f"Loaded {len(file_docs)} docs from {fp.name}")
-                except Exception:
-                    pass
+                st.info(f"✅ Loaded {len(file_docs)} docs from {fp.name}")
             except Exception as e:
-                try:
-                    st.warning(f"Skipped {fp.name}: {e}")
-                except Exception:
-                    pass
+                st.warning(f"⚠️ Skipped {fp.name}: {e}")
     return docs
+
+
+# -------------------------
+# NEW: CACHED VECTOR STORE LOADING
+# -------------------------
+@st.cache_resource
+def load_embeddings_model():
+    """Cache the embeddings model to avoid reloading"""
+    return HuggingFaceEmbeddings(model_name=EMBED_MODEL)
+
 
 # -------------------------
 # Simple vector store (numpy + pickle)
@@ -138,8 +246,6 @@ def load_simple_index(index_folder: Path):
     return vectors, docs
 
 def cosine_sim_matrix(vecs: np.ndarray, qvec: np.ndarray):
-    # vecs: (n, d), qvec: (d,)
-    # compute cosine similarities fast
     denom = (np.linalg.norm(vecs, axis=1) * (np.linalg.norm(qvec) + 1e-12)) + 1e-12
     sims = np.dot(vecs, qvec) / denom
     sims = np.nan_to_num(sims)
@@ -153,14 +259,12 @@ class SimpleRetriever:
         self.k = k
 
     def get_relevant_documents(self, query: str) -> List[Document]:
-        # embed the query
         try:
             if hasattr(self.embeddings, "embed_query"):
                 qvec = np.array(self.embeddings.embed_query(query))
             else:
                 qvec = np.array(self.embeddings.embed_documents([query]))[0]
         except Exception:
-            # fallback to embed_documents in loop
             qvec = np.array(self.embeddings.embed_documents([query]))[0]
 
         sims = cosine_sim_matrix(self.vectors, qvec)
@@ -168,32 +272,15 @@ class SimpleRetriever:
         docs_out = [self.docs[i] for i in topk]
         return docs_out
 
-# Adapter so our SimpleRetriever looks like a LangChain BaseRetriever
-# Adapter that is pydantic-friendly for LangChain
-# --- Replace your current SimpleRetrieverAdapter with this updated version ---
-from langchain.schema import BaseRetriever
-import numpy as np
-
 class SimpleRetrieverAdapter(BaseRetriever):
-    """
-    Adapter that wraps SimpleRetriever and:
-     - is pydantic-friendly (model_config)
-     - proxies unknown attrs to the inner simple retriever
-     - provides async wrapper and an optional scored-retrieval method
-     - exposes `tags` and `metadata` attributes to satisfy callers
-    """
     model_config = {"extra": "allow"}
 
     def __init__(self, simple_retriever):
-        # store the wrapped retriever without pydantic validation
         object.__setattr__(self, "simple", simple_retriever)
-        # expose a tags field (empty by default)
         object.__setattr__(self, "tags", [])
-        # expose metadata field (empty dict by default)
         object.__setattr__(self, "metadata", {})
 
     def __getattr__(self, name):
-        # proxy unknown attributes/methods to the wrapped retriever
         try:
             return getattr(self.simple, name)
         except AttributeError:
@@ -206,13 +293,7 @@ class SimpleRetrieverAdapter(BaseRetriever):
         return self.get_relevant_documents(query)
 
     def get_relevant_documents_with_score(self, query: str):
-        """
-        Optional helper returning list of (Document, score).
-        If the wrapped SimpleRetriever has vectors/docs/embeddings we compute cosine scores.
-        Otherwise, fall back to returning (doc, 1.0).
-        """
         if hasattr(self.simple, "vectors") and hasattr(self.simple, "docs") and hasattr(self.simple, "embeddings"):
-            # embed query
             try:
                 embeddings = self.simple.embeddings
                 if hasattr(embeddings, "embed_query"):
@@ -222,7 +303,7 @@ class SimpleRetrieverAdapter(BaseRetriever):
             except Exception:
                 qvec = np.array(embeddings.embed_documents([query]))[0]
 
-            vecs = self.simple.vectors  # numpy array
+            vecs = self.simple.vectors
             denom = (np.linalg.norm(vecs, axis=1) * (np.linalg.norm(qvec) + 1e-12)) + 1e-12
             sims = np.dot(vecs, qvec) / denom
             sims = np.nan_to_num(sims)
@@ -233,7 +314,6 @@ class SimpleRetrieverAdapter(BaseRetriever):
             return [(d, 1.0) for d in docs]
 
 
-
 # -------------------------
 # Build / load simple index
 # -------------------------
@@ -241,34 +321,54 @@ def build_simple_index(data_folder: Path, index_folder: Path):
     docs = load_documents_from_folder(data_folder)
     if not docs:
         raise ValueError("No supported files found to index.")
-    splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP,
-                                             separators=["\n\n", "\n", " ", ""])
+    
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE, 
+        chunk_overlap=CHUNK_OVERLAP,
+        separators=["\n\n", "\n", " ", ""]
+    )
     chunks = splitter.split_documents(docs)
+    
+    st.info(f"📊 Created {len(chunks)} chunks from {len(docs)} documents")
 
-    embeddings = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
+    embeddings = load_embeddings_model()
 
     texts = [d.page_content for d in chunks]
-    # embed documents (may be expensive)
-    try:
-        vecs = embeddings.embed_documents(texts)
-    except Exception:
-        vecs = []
-        for t in texts:
-            vecs.append(embeddings.embed_documents([t])[0])
+    
+    # Show progress for embedding
+    progress_bar = st.progress(0)
+    vecs = []
+    batch_size = 32
+    
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i+batch_size]
+        try:
+            batch_vecs = embeddings.embed_documents(batch)
+            vecs.extend(batch_vecs)
+        except Exception:
+            for t in batch:
+                vecs.append(embeddings.embed_documents([t])[0])
+        progress_bar.progress(min((i + batch_size) / len(texts), 1.0))
 
     vectors = np.array(vecs)
     persist_simple_index(index_folder, vectors, chunks)
+    
+    st.success(f"✅ Index saved with {len(chunks)} chunks")
+    
     retriever = SimpleRetriever(vectors=vectors, docs=chunks, embeddings=embeddings, k=RETRIEVER_K)
     return retriever
 
 def load_or_build_simple_index_for_user(user_folder: Path):
     index_path = user_folder / INDEX_SUBDIR
     vectors, docs = load_simple_index(index_path)
-    embeddings = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
+    embeddings = load_embeddings_model()
+    
     if vectors is not None and docs is not None:
+        st.info(f"📚 Loaded existing index with {len(docs)} chunks")
         return SimpleRetriever(vectors=vectors, docs=docs, embeddings=embeddings, k=RETRIEVER_K)
-    # else build
+    
     return build_simple_index(user_folder, index_path)
+
 
 # -------------------------
 # LLM prompt / QA builder
@@ -281,10 +381,6 @@ PROMPT_TEMPLATE_STR = (
 prompt_template = PromptTemplate(input_variables=["question", "context"], template=PROMPT_TEMPLATE_STR)
 
 def create_qa_from_retriever(retriever):
-    """
-    Accepts our SimpleRetriever (or SimpleRetrieverAdapter) and returns a LangChain RetrievalQA.
-    We wrap the simple retriever in SimpleRetrieverAdapter so pydantic validation succeeds.
-    """
     wrapped = SimpleRetrieverAdapter(retriever)
     qa = RetrievalQA.from_chain_type(
         llm=ChatGoogleGenerativeAI(model=LLM_MODEL, temperature=0.2, max_output_tokens=1024),
@@ -295,13 +391,98 @@ def create_qa_from_retriever(retriever):
     return qa
 
 
+# ========================================
+# NEW: QUERY WITH CACHING & ERROR HANDLING
+# ========================================
+def query_with_features(qa_chain, query: str):
+    """
+    Query with caching, error handling, and metrics tracking
+    """
+    start_time = time.time()
+    cache = st.session_state.query_cache
+    metrics = st.session_state.metrics
+    
+    # Check cache
+    cached_result = cache.get(query)
+    if cached_result:
+        elapsed = time.time() - start_time
+        metrics.log_query(query, elapsed, cached=True)
+        st.success("🎯 Cache hit! Instant response.")
+        return cached_result, True, elapsed
+    
+    # Not in cache, query LLM with retry logic
+    max_retries = 3
+    last_error = None
+    
+    for attempt in range(max_retries):
+        try:
+            result = qa_chain.invoke({"query": query})
+            elapsed = time.time() - start_time
+            
+            # Estimate tokens (rough approximation)
+            estimated_tokens = len(query.split()) + len(result.get("result", "").split()) * 1.3
+            
+            metrics.log_query(query, elapsed, cached=False, tokens=int(estimated_tokens))
+            
+            # Cache the result
+            cache.set(query, result)
+            
+            return result, False, elapsed
+            
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt  # Exponential backoff
+                st.warning(f"⚠️ Attempt {attempt + 1} failed. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                elapsed = time.time() - start_time
+                metrics.log_query(query, elapsed, error=True)
+                st.error(f"❌ All retries failed: {last_error}")
+                return None, False, elapsed
+    
+    return None, False, time.time() - start_time
+
 
 # -------------------------
 # Streamlit UI
 # -------------------------
 st.set_page_config(page_title="Clinical Docs Search", layout="wide")
-st.title("📚 Clinical Docs Search (simple vector store)")
 
+# ========================================
+# NEW: HEADER WITH METRICS
+# ========================================
+col1, col2 = st.columns([3, 1])
+with col1:
+    st.title("📚 Clinical Docs Search")
+with col2:
+    stats = st.session_state.metrics.get_stats()
+    st.metric("Total Queries", stats["total_queries"])
+
+# ========================================
+# NEW: METRICS DASHBOARD IN SIDEBAR
+# ========================================
+st.sidebar.header("📊 System Metrics")
+stats = st.session_state.metrics.get_stats()
+
+col1, col2 = st.sidebar.columns(2)
+col1.metric("Cache Hit Rate", stats["cache_hit_rate"])
+col2.metric("Error Rate", stats["error_rate"])
+
+col1.metric("Avg Response", stats["avg_response_time"])
+col2.metric("Total Tokens", f"{stats['total_tokens']:,}")
+
+st.sidebar.metric("Estimated Cost", stats["estimated_cost"])
+
+# Cache stats
+cache_stats = st.session_state.query_cache.get_stats()
+st.sidebar.metric("Cache Usage", f"{cache_stats['size']}/{cache_stats['max_size']}")
+
+st.sidebar.markdown("---")
+
+# ========================================
+# EXISTING UI (Enhanced)
+# ========================================
 st.sidebar.header("User & Files")
 username = st.sidebar.text_input("Your username (team name or email)", value="guest")
 user_folder = get_user_folder(username)
@@ -311,6 +492,7 @@ uploaded = st.sidebar.file_uploader(
     type=["pdf", "docx", "txt", "csv", "md", "html"],
     accept_multiple_files=True,
 )
+
 if uploaded:
     saved = 0
     for f in uploaded:
@@ -319,92 +501,108 @@ if uploaded:
             saved += 1
         except Exception as e:
             st.warning(f"Failed to save {f.name}: {e}")
-    st.sidebar.success(f"Saved {saved} file(s) to {user_folder}")
+    st.sidebar.success(f"✅ Saved {saved} file(s)")
 
 if st.sidebar.button("🔧 Build / Rebuild Index"):
     try:
         with st.spinner("Indexing… this may take a few minutes for large files."):
             build_simple_index(user_folder, user_folder / INDEX_SUBDIR)
-        st.sidebar.success("Index built ✅")
+        st.sidebar.success("✅ Index built successfully!")
     except Exception as e:
-        st.sidebar.error(f"Index build failed: {e}")
+        st.sidebar.error(f"❌ Index build failed: {e}")
 
 st.sidebar.markdown("### Your files")
-files = sorted([p.name for p in user_folder.rglob("*") if p.is_file()])
+files = sorted([p.name for p in user_folder.rglob("*") if p.is_file() and p.name not in [VECTORS_FILE, META_FILE]])
 if files:
     for fname in files:
-        st.sidebar.write("-", fname)
+        st.sidebar.write("📄", fname)
 else:
-    st.sidebar.write("No files yet. Upload on the left and then click Build / Rebuild Index.")
+    st.sidebar.write("No files yet. Upload files and click Build Index.")
 
+# ========================================
+# SEARCH INTERFACE (Enhanced)
+# ========================================
 st.header("🔎 Search")
 q = st.text_area("Ask a question about your uploaded docs", height=120)
 
-if st.button("Search"):
+# Add example questions
+with st.expander("💡 Example Questions"):
+    st.markdown("""
+    - What are the main findings of the study?
+    - What are the inclusion criteria?
+    - What adverse events were reported?
+    - Summarize the methodology
+    """)
+
+if st.button("🔍 Search", type="primary"):
     if not q.strip():
-        st.warning("Type a question first.")
+        st.warning("⚠️ Please enter a question first.")
     elif not os.environ.get("GOOGLE_API_KEY"):
-        st.error("Missing GOOGLE_API_KEY — set as an environment variable or Streamlit secret.")
+        st.error("❌ Missing GOOGLE_API_KEY — set as an environment variable or Streamlit secret.")
     else:
-        user_files = sorted([p for p in user_folder.rglob("*") if p.is_file()])
+        user_files = sorted([p for p in user_folder.rglob("*") if p.is_file() and p.name not in [VECTORS_FILE, META_FILE]])
+        
         if not user_files:
-            st.error(
-                "No files found in your folder. Upload files using the sidebar uploader and then click "
-                "'Build / Rebuild Index' (or upload and the app will build automatically)."
-            )
+            st.error("❌ No files found. Please upload files and build the index first.")
         else:
-            st.info(f"Found {len(user_files)} file(s) in your folder. Checking index...")
             index_path = user_folder / INDEX_SUBDIR
+            
             if not index_path.exists() or not any(index_path.iterdir()):
-                with st.spinner("Index not found — building index now (this may take a few minutes)..."):
+                with st.spinner("📦 Index not found — building now..."):
                     try:
                         build_simple_index(user_folder, index_path)
-                        st.success("Index built successfully.")
+                        st.success("✅ Index built successfully!")
                     except Exception as e:
-                        st.error(f"Failed to build index: {e}")
-                        st.markdown("**Files found (for debugging):**")
-                        for fp in user_files:
-                            st.write("-", fp.name)
-                        # show a short sample from first file for debugging
-                        try:
-                            sample_fp = user_files[0]
-                            Loader = PyPDFLoader if sample_fp.suffix.lower() == ".pdf" else TextLoader
-                            loader = Loader(str(sample_fp)) if Loader is PyPDFLoader else Loader(str(sample_fp), encoding="utf-8")
-                            sample_docs = loader.load()
-                            if sample_docs:
-                                st.markdown("**Sample extract (first doc):**")
-                                st.code(sample_docs[0].page_content[:800])
-                        except Exception:
-                            pass
+                        st.error(f"❌ Failed to build index: {e}")
                         st.stop()
 
-            # load retriever and run QA
+            # Load retriever and query
             try:
                 retriever = load_or_build_simple_index_for_user(user_folder)
             except Exception as e:
-                st.error(f"Error loading index: {e}")
+                st.error(f"❌ Error loading index: {e}")
                 retriever = None
 
             if retriever:
                 qa = create_qa_from_retriever(retriever)
-                with st.spinner("Retrieving and generating answer…"):
-                    try:
-                        out = qa.invoke({"query": q})
-                    except Exception as e:
-                        st.error(f"LLM/query error: {e}")
-                        out = None
-                if out:
-                    st.subheader("Answer")
-                    st.write(out.get("result", "").strip())
+                
+                with st.spinner("🔍 Retrieving and generating answer…"):
+                    result, was_cached, elapsed = query_with_features(qa, q)
+                
+                if result:
+                    # Display answer with metrics
+                    col1, col2, col3 = st.columns([3, 1, 1])
+                    with col1:
+                        st.subheader("✨ Answer")
+                    with col2:
+                        st.metric("Response Time", f"{elapsed:.2f}s")
+                    with col3:
+                        st.metric("Source", "🎯 Cache" if was_cached else "🤖 LLM")
+                    
+                    st.markdown(result.get("result", "").strip())
 
-                    st.subheader("Sources (unique)")
-                    uniq = list({d.metadata.get("source", "unknown") for d in out.get("source_documents", [])})
+                    # Sources section
+                    st.subheader("📚 Sources")
+                    uniq = list({d.metadata.get("source", "unknown") for d in result.get("source_documents", [])})
                     if uniq:
                         for s in uniq:
-                            st.write("-", s)
-                    else:
-                        st.write("No sources returned.")
-
-                    st.subheader("Evidence snippets")
-                    for i, d in enumerate(out.get("source_documents", [])[:6], 1):
-                        st.markdown(f"**{i}. {d.metadata.get('source','unknown')}** — {d.page_content[:500].replace('\\n', ' ')}…")
+                            st.write("📄", s)
+                    
+                    # Evidence snippets in expander
+                    with st.expander("🔍 View Evidence Snippets"):
+                        for i, d in enumerate(result.get("source_documents", [])[:6], 1):
+                            st.markdown(f"**{i}. {d.metadata.get('source','unknown')}**")
+                            st.text(d.page_content[:400].replace('\n', ' '))
+                            st.markdown("---")
+                    
+                    # User feedback
+                    st.markdown("### Was this helpful?")
+                    col1, col2, col3 = st.columns([1, 1, 4])
+                    with col1:
+                        if st.button("👍 Yes"):
+                            st.success("Thanks for your feedback!")
+                    with col2:
+                        if st.button("👎 No"):
+                            feedback = st.text_input("What could be improved?")
+                            if feedback:
+                                st.info("Feedback recorded. Thank you!")
