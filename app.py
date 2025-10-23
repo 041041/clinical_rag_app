@@ -32,7 +32,8 @@ from langchain_community.document_loaders import (
     Docx2txtLoader,
     UnstructuredHTMLLoader,
 )
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+# NEW (correct)
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain.docstore.document import Document
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.chains import RetrievalQA
