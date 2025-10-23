@@ -571,7 +571,7 @@ def _call_chain_safe(qa_chain, query: str):
                 res = fn(query)
             # Normalize results:
             if isinstance(res, dict):
-                # expected shape: {"result": "...", "source_documents": [...]}
+                # expected shape: {"result": "...", "source_documents": [...]} 
                 return res
             if isinstance(res, str):
                 return {"result": res, "source_documents": []}
@@ -662,13 +662,13 @@ st.sidebar.header("📊 System Metrics")
 stats = st.session_state.metrics.get_stats()
 
 col1, col2 = st.sidebar.columns(2)
-col1.metric("Cache Hit Rate", stats["cache_hit_rate"])
+col1.metric("Cache Hit Rate", stats["cache_hit_rate"]) 
 col2.metric("Error Rate", stats["error_rate"])
 
 col1.metric("Avg Response", stats["avg_response_time"])
 col2.metric("Total Tokens", f"{stats['total_tokens']:,}")
 
-st.sidebar.metric("Estimated Cost", stats["estimated_cost"])
+st.sidebar.metric("Estimated Cost", stats["estimated_cost"]) 
 
 # Cache stats
 cache_stats = st.session_state.query_cache.get_stats()
