@@ -1,12 +1,12 @@
-# app.py - ENHANCED VERSION
+# app.py - ENHANCED VERSION (patched, robust imports + safe QA invocation)
 # Added: Caching, Error Handling, Metrics, Cost Tracking, Performance Monitoring
 
-# app.py - FULLY CORRECTED IMPORTS
 import os
 import asyncio
 from pathlib import Path
 from typing import List
 import pickle
+from math import sqrt
 import time
 from datetime import datetime
 import hashlib
@@ -14,7 +14,7 @@ import hashlib
 import numpy as np
 import streamlit as st
 
-# Ensure an asyncio event loop exists
+# Ensure an asyncio event loop exists for the current thread (Streamlit-related fix)
 def ensure_event_loop():
     try:
         asyncio.get_running_loop()
@@ -24,21 +24,112 @@ def ensure_event_loop():
 
 ensure_event_loop()
 
-# LangChain imports - ALL CORRECTED
-from langchain_community.document_loaders import (
-    PyPDFLoader,
-    TextLoader,
-    CSVLoader,
-    Docx2txtLoader,
-    UnstructuredHTMLLoader,
-)
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.documents import Document
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.chains import RetrievalQA
-from langchain_core.prompts import PromptTemplate
-from langchain_core.retrievers import BaseRetriever
-from langchain_huggingface import HuggingFaceEmbeddings
+# -------------------------
+# LangChain loaders and helpers (robust across versions)
+# -------------------------
+# Try to import Document from a few possible locations
+try:
+    from langchain_core.documents import Document
+except Exception:
+    try:
+        from langchain.docstore.document import Document
+    except Exception:
+        try:
+            from langchain.schema import Document
+        except Exception:
+            # minimal fallback Document
+            class Document:
+                def __init__(self, page_content="", metadata=None):
+                    self.page_content = page_content
+                    self.metadata = metadata or {}
+
+# Text splitters
+try:
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+except Exception:
+    try:
+        from langchain.text_splitter import RecursiveCharacterTextSplitter
+    except Exception:
+        RecursiveCharacterTextSplitter = None  # will error when used if missing
+
+# Document loaders (community package / fallback)
+_loaded_loaders = False
+try:
+    from langchain_community.document_loaders import (
+        PyPDFLoader,
+        TextLoader,
+        CSVLoader,
+        Docx2txtLoader,
+        UnstructuredHTMLLoader,
+    )
+    _loaded_loaders = True
+except Exception:
+    try:
+        from langchain.document_loaders import (
+            PyPDFLoader,
+            TextLoader,
+            CSVLoader,
+            Docx2txtLoader,
+            UnstructuredHTMLLoader,
+        )
+        _loaded_loaders = True
+    except Exception:
+        PyPDFLoader = TextLoader = CSVLoader = Docx2txtLoader = UnstructuredHTMLLoader = None
+
+# RetrievalQA import (multiple possible locations)
+RetrievalQA = None
+try:
+    from langchain.chains.retrieval_qa.base import RetrievalQA
+except Exception:
+    try:
+        from langchain_community.chains import RetrievalQA
+    except Exception:
+        try:
+            from langchain.chains import RetrievalQA
+        except Exception:
+            RetrievalQA = None
+
+# PromptTemplate import (try a few locations)
+try:
+    from langchain.prompts import PromptTemplate
+except Exception:
+    try:
+        from langchain.prompt import PromptTemplate
+    except Exception:
+        class PromptTemplate:
+            def __init__(self, input_variables=None, template=""):
+                self.input_variables = input_variables or []
+                self.template = template
+
+# BaseRetriever type (adapter uses it)
+try:
+    from langchain.schema import BaseRetriever
+except Exception:
+    try:
+        from langchain_core.schema import BaseRetriever
+    except Exception:
+        BaseRetriever = object  # fallback - duck typing will be used
+
+# Google Gemini integration (langchain-google-genai package)
+try:
+    from langchain_google_genai import ChatGoogleGenerativeAI
+except Exception:
+    ChatGoogleGenerativeAI = None
+
+# sentence-transformers
+try:
+    from sentence_transformers import SentenceTransformer
+except Exception:
+    SentenceTransformer = None
+
+# HuggingFace embeddings wrapper
+try:
+    from langchain_huggingface import HuggingFaceEmbeddings
+except Exception:
+    try:
+        from langchain.embeddings.huggingface import HuggingFaceEmbeddings
+    except Exception:
+        HuggingFaceEmbeddings = None
 
 # -------------------------
 # CONFIG
@@ -104,7 +195,7 @@ class MetricsTracker:
         non_cached = [q for q in self.queries if not q["cached"]]
         avg_time = sum(q["response_time"] for q in non_cached) / len(non_cached) if non_cached else 0
         
-        # Gemini Flash pricing: ~$0.35 per 1M tokens (input + output)
+        # Gemini Flash pricing: ~$0.35 per 1M tokens (input + output) — approximate
         estimated_cost = (self.total_tokens / 1_000_000) * 0.35
         
         return {
@@ -218,6 +309,8 @@ def load_documents_from_folder(folder: Path) -> List[Document]:
 @st.cache_resource
 def load_embeddings_model():
     """Cache the embeddings model to avoid reloading"""
+    if HuggingFaceEmbeddings is None:
+        raise RuntimeError("HuggingFaceEmbeddings not available — install langchain-huggingface or provide embeddings.")
     return HuggingFaceEmbeddings(model_name=EMBED_MODEL)
 
 
@@ -321,6 +414,9 @@ def build_simple_index(data_folder: Path, index_folder: Path):
     if not docs:
         raise ValueError("No supported files found to index.")
     
+    if RecursiveCharacterTextSplitter is None:
+        raise RuntimeError("Text splitter not available — install langchain-text-splitters or compatible langchain.")
+
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE, 
         chunk_overlap=CHUNK_OVERLAP,
@@ -379,28 +475,132 @@ PROMPT_TEMPLATE_STR = (
 )
 prompt_template = PromptTemplate(input_variables=["question", "context"], template=PROMPT_TEMPLATE_STR)
 
+
+# -------------------------
+# Create QA chain (robust, supports different langchain layouts)
+# -------------------------
 def create_qa_from_retriever(retriever):
     wrapped = SimpleRetrieverAdapter(retriever)
-    qa = RetrievalQA.from_chain_type(
-        llm=ChatGoogleGenerativeAI(model=LLM_MODEL, temperature=0.2, max_output_tokens=1024),
-        retriever=wrapped,
-        return_source_documents=True,
-        chain_type_kwargs={"prompt": prompt_template},
-    )
-    return qa
+
+    # prepare LLM instance
+    if ChatGoogleGenerativeAI is None:
+        raise RuntimeError("ChatGoogleGenerativeAI (langchain-google-genai) not available; install langchain-google-genai.")
+    llm = ChatGoogleGenerativeAI(model=LLM_MODEL, temperature=0.2, max_output_tokens=1024)
+
+    # Try multiple creation patterns depending on langchain version
+    try:
+        if RetrievalQA is None:
+            raise ImportError("RetrievalQA not importable in this environment.")
+        qa = RetrievalQA.from_chain_type(
+            llm=llm,
+            retriever=wrapped,
+            return_source_documents=True,
+            chain_type="stuff",
+            chain_type_kwargs={"prompt": prompt_template},
+        )
+        return qa
+    except Exception:
+        try:
+            # direct constructor path
+            qa = RetrievalQA(llm=llm, retriever=wrapped, return_source_documents=True)
+            return qa
+        except Exception:
+            # Fallback minimal wrapper
+            class SimpleQAWrapper:
+                def __init__(self, llm, retriever, prompt_template):
+                    self.llm = llm
+                    self.retriever = retriever
+                    self.prompt = prompt_template
+
+                def _build_input(self, query):
+                    docs = self.retriever.get_relevant_documents(query)
+                    context = "\n\n".join([d.page_content for d in docs])
+                    prompt = self.prompt.template.format(question=query, context=context) if hasattr(self.prompt, "template") else f"Question: {query}\nContext:\n{context}"
+                    return prompt, docs
+
+                def run(self, query):
+                    prompt_text, docs = self._build_input(query)
+                    # Try llm.predict / llm.generate / llm.__call__
+                    try:
+                        if hasattr(self.llm, "predict") and callable(getattr(self.llm, "predict")):
+                            text = self.llm.predict(prompt_text)
+                        elif hasattr(self.llm, "generate") and callable(getattr(self.llm, "generate")):
+                            gen = self.llm.generate([prompt_text])
+                            # try to extract text
+                            if isinstance(gen, dict) and "text" in gen:
+                                text = gen["text"]
+                            elif hasattr(gen, "generations"):
+                                text = gen.generations[0][0].text
+                            else:
+                                text = str(gen)
+                        elif callable(self.llm):
+                            out = self.llm(prompt_text)
+                            # try to handle dict-like output
+                            if isinstance(out, dict) and "candidates" in out:
+                                text = out.get("candidates")[0]
+                            else:
+                                text = str(out)
+                        else:
+                            raise RuntimeError("LLM has no callable predict/generate/__call__ method")
+                    except Exception as e:
+                        raise RuntimeError(f"LLM call failed: {e}")
+                    return {"result": text, "source_documents": docs}
+
+            return SimpleQAWrapper(llm=llm, retriever=wrapped, prompt_template=prompt_template)
 
 
-# ========================================
-# NEW: QUERY WITH CACHING & ERROR HANDLING
-# ========================================
+# -------------------------
+# Safe chain invocation helpers & query_with_features
+# -------------------------
+def _call_chain_safe(qa_chain, query: str):
+    """
+    Try common invocation methods: .invoke (LLMChain style), .run, .__call__, .predict, .generate
+    Normalize to dict with keys: result (text) and source_documents (list of Documents)
+    """
+    call_methods = ["invoke", "run", "__call__", "predict", "generate"]
+    last_err = None
+    for m in call_methods:
+        fn = getattr(qa_chain, m, None)
+        if not fn:
+            continue
+        try:
+            # some methods accept raw string, others expect dict
+            if m in ("invoke",):
+                res = fn({"query": query})
+            else:
+                res = fn(query)
+            # Normalize results:
+            if isinstance(res, dict):
+                # expected shape: {"result": "...", "source_documents": [...]}
+                return res
+            if isinstance(res, str):
+                return {"result": res, "source_documents": []}
+            # langchain .generate / .predict might return complex object
+            try:
+                if hasattr(res, "generations"):
+                    text = ""
+                    gen = res.generations
+                    if gen and isinstance(gen[0], list) and hasattr(gen[0][0], "text"):
+                        text = gen[0][0].text
+                    elif gen and hasattr(gen[0], "text"):
+                        text = gen[0].text
+                    return {"result": text, "source_documents": getattr(res, "source_documents", []) or []}
+            except Exception:
+                pass
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"Could not invoke QA chain - last error: {last_err}")
+
 def query_with_features(qa_chain, query: str):
     """
-    Query with caching, error handling, and metrics tracking
+    Query with caching, error handling, and metrics — uses _call_chain_safe to support many chain APIs.
+    Returns (result_dict_or_None, was_cached:bool, elapsed_seconds)
     """
     start_time = time.time()
     cache = st.session_state.query_cache
     metrics = st.session_state.metrics
-    
+
     # Check cache
     cached_result = cache.get(query)
     if cached_result:
@@ -408,26 +608,23 @@ def query_with_features(qa_chain, query: str):
         metrics.log_query(query, elapsed, cached=True)
         st.success("🎯 Cache hit! Instant response.")
         return cached_result, True, elapsed
-    
+
     # Not in cache, query LLM with retry logic
     max_retries = 3
     last_error = None
-    
+
     for attempt in range(max_retries):
         try:
-            result = qa_chain.invoke({"query": query})
+            result = _call_chain_safe(qa_chain, query)
             elapsed = time.time() - start_time
-            
+
             # Estimate tokens (rough approximation)
-            estimated_tokens = len(query.split()) + len(result.get("result", "").split()) * 1.3
-            
+            estimated_tokens = int(len(query.split()) + len(result.get("result", "").split()) * 1.3)
+
             metrics.log_query(query, elapsed, cached=False, tokens=int(estimated_tokens))
-            
-            # Cache the result
             cache.set(query, result)
-            
             return result, False, elapsed
-            
+
         except Exception as e:
             last_error = e
             if attempt < max_retries - 1:
@@ -439,7 +636,7 @@ def query_with_features(qa_chain, query: str):
                 metrics.log_query(query, elapsed, error=True)
                 st.error(f"❌ All retries failed: {last_error}")
                 return None, False, elapsed
-    
+
     return None, False, time.time() - start_time
 
 
@@ -563,7 +760,11 @@ if st.button("🔍 Search", type="primary"):
                 retriever = None
 
             if retriever:
-                qa = create_qa_from_retriever(retriever)
+                try:
+                    qa = create_qa_from_retriever(retriever)
+                except Exception as e:
+                    st.error(f"❌ QA chain init failed: {e}")
+                    st.stop()
                 
                 with st.spinner("🔍 Retrieving and generating answer…"):
                     result, was_cached, elapsed = query_with_features(qa, q)
@@ -578,8 +779,8 @@ if st.button("🔍 Search", type="primary"):
                     with col3:
                         st.metric("Source", "🎯 Cache" if was_cached else "🤖 LLM")
                     
-                    st.markdown(result.get("result", "").strip())
-
+                    st.markdown(result.get("result", "").strip() if result.get("result") else "")
+                    
                     # Sources section
                     st.subheader("📚 Sources")
                     uniq = list({d.metadata.get("source", "unknown") for d in result.get("source_documents", [])})
