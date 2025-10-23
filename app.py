@@ -1,12 +1,12 @@
 # app.py - ENHANCED VERSION
 # Added: Caching, Error Handling, Metrics, Cost Tracking, Performance Monitoring
 
+# app.py - FULLY CORRECTED IMPORTS
 import os
 import asyncio
 from pathlib import Path
 from typing import List
 import pickle
-from math import sqrt
 import time
 from datetime import datetime
 import hashlib
@@ -14,7 +14,7 @@ import hashlib
 import numpy as np
 import streamlit as st
 
-# Ensure an asyncio event loop exists for the current thread (Streamlit-related fix)
+# Ensure an asyncio event loop exists
 def ensure_event_loop():
     try:
         asyncio.get_running_loop()
@@ -24,7 +24,7 @@ def ensure_event_loop():
 
 ensure_event_loop()
 
-# LangChain loaders and helpers
+# LangChain imports - ALL CORRECTED
 from langchain_community.document_loaders import (
     PyPDFLoader,
     TextLoader,
@@ -32,14 +32,12 @@ from langchain_community.document_loaders import (
     Docx2txtLoader,
     UnstructuredHTMLLoader,
 )
-# NEW (correct)
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.chains.retrieval_qa.base import RetrievalQA
-from langchain.prompts import PromptTemplate
-from langchain.schema import BaseRetriever
-from sentence_transformers import SentenceTransformer
+from langchain.chains import RetrievalQA
+from langchain_core.prompts import PromptTemplate
+from langchain_core.retrievers import BaseRetriever
 from langchain_huggingface import HuggingFaceEmbeddings
 
 # -------------------------
