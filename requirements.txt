@@ -1,13 +1,25 @@
-streamlit
-langchain
-langchain-community
-langchain-google-genai
-sentence-transformers
-pypdf
-python-docx
-docx2txt
-pandas
-cryptography>=3.1
-numpy
-sentence-transformers
-langchain-huggingface
+# Core UI framework
+streamlit==1.38.0
+
+# LangChain ecosystem (pinned to avoid import errors)
+langchain==0.2.14
+langchain-core==0.2.26
+langchain-community==0.2.12
+langchain-text-splitters==0.2.2
+
+# LLM integrations
+langchain-google-genai==1.0.5
+langchain-huggingface==0.0.3
+
+# Embeddings and sentence models
+sentence-transformers==3.1.1
+
+# Document loaders and parsers
+pypdf==4.3.1
+python-docx==1.1.2
+docx2txt==0.8
+
+# Data & security utilities
+pandas==2.2.3
+numpy==1.26.4
+cryptography==42.0.8
