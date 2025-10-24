@@ -388,102 +388,71 @@ class SimpleQAWrapper:
             prompt_text = f"Question: {query}\nContext:\n{context}"
         return prompt_text, docs
 
-    def _call_llm_variants(self, prompt_text: str):
+        def _call_llm_variants(self, prompt_text: str):
         """
-        Robustly call the LLM using the most-likely methods for ChatGoogleGenerativeAI:
-          1) generate([prompt_text])
-          2) invoke({"query": prompt_text}) or invoke(prompt_text)
-          3) agenerate / ainvoke (async) are not attempted here (sync only)
-        Normalize result via _extract_text_from_llm_response.
+        Preferred call order for ChatGoogleGenerativeAI discovered from debug:
+          1) invoke(prompt_str) -> returns AIMessage (has .content)
+          2) generate([...]) if we construct proper message objects (not used here)
+          3) other fallbacks (predict/create/etc.) if available
+        Always normalize via _extract_text_from_llm_response and return (text, raw, source_docs).
         """
         last_err = None
         last_raw = None
 
-        # 1) Prefer generate(list_of_prompts)
-        gen_fn = getattr(self.llm, "generate", None)
-        if callable(gen_fn):
-            try:
-                raw = gen_fn([prompt_text])
-                last_raw = raw
-                text, raw_saved = _extract_text_from_llm_response(raw)
-                source_docs = (
-                    getattr(raw, "source_documents", None)
-                    or (raw.get("source_documents") if isinstance(raw, dict) else None)
-                    or []
-                )
-                return text, raw_saved, source_docs
-            except Exception as e:
-                last_err = e
-
-        # 2) Try invoke with dict or string forms
+        # 1) Prefer invoking with a plain string (works for your installed wrapper)
         inv_fn = getattr(self.llm, "invoke", None)
         if callable(inv_fn):
             try:
-                raw = inv_fn({"query": prompt_text})
+                raw = inv_fn(prompt_text)   # <-- call with string (works per your debug)
                 last_raw = raw
+                # If raw has .content (AIMessage), use it; otherwise fall back to extractor
+                if hasattr(raw, "content") and isinstance(getattr(raw, "content"), str):
+                    text = raw.content
+                    source_docs = getattr(raw, "source_documents", None) or []
+                    return text, raw, source_docs
+                # otherwise normalize generically
                 text, raw_saved = _extract_text_from_llm_response(raw)
-                source_docs = (
-                    getattr(raw, "source_documents", None)
-                    or (raw.get("source_documents") if isinstance(raw, dict) else None)
-                    or []
-                )
-                return text, raw_saved, source_docs
-            except Exception as e:
-                last_err = e
-            try:
-                raw = inv_fn(prompt_text)
-                last_raw = raw
-                text, raw_saved = _extract_text_from_llm_response(raw)
-                source_docs = (
-                    getattr(raw, "source_documents", None)
-                    or (raw.get("source_documents") if isinstance(raw, dict) else None)
-                    or []
-                )
+                source_docs = getattr(raw, "source_documents", None) or []
                 return text, raw_saved, source_docs
             except Exception as e:
                 last_err = e
 
-        # 3) Try generate with list-of-dict payload
+        # 2) Try generate if we can craft correct input objects (not using plain str)
+        gen_fn = getattr(self.llm, "generate", None)
         if callable(gen_fn):
             try:
+                # generate expects message-like objects; building minimal structure may vary by SDK
+                # We'll attempt a safe form that some wrappers accept: a list of dicts with "content"
                 raw = gen_fn([{"content": prompt_text}])
                 last_raw = raw
                 text, raw_saved = _extract_text_from_llm_response(raw)
-                source_docs = (
-                    getattr(raw, "source_documents", None)
-                    or (raw.get("source_documents") if isinstance(raw, dict) else None)
-                    or []
-                )
+                source_docs = getattr(raw, "source_documents", None) or []
                 return text, raw_saved, source_docs
             except Exception as e:
                 last_err = e
 
-        # 4) Try other common callables
+        # 3) Other common callables
         for name in ("predict", "create", "chat", "respond", "answer"):
             fn = getattr(self.llm, name, None)
             if not callable(fn):
                 continue
             try:
-                raw = fn(prompt_text) if name != "generate" else fn([prompt_text])
+                raw = fn(prompt_text)
                 last_raw = raw
                 text, raw_saved = _extract_text_from_llm_response(raw)
-                source_docs = (
-                    getattr(raw, "source_documents", None)
-                    or (raw.get("source_documents") if isinstance(raw, dict) else None)
-                    or []
-                )
+                source_docs = getattr(raw, "source_documents", None) or []
                 return text, raw_saved, source_docs
             except Exception as e:
                 last_err = e
                 continue
 
-        # 5) Nothing worked — raise with helpful debug info
+        # Nothing worked — raise with debug info
         raw_type = type(last_raw).__name__ if last_raw is not None else "None"
-        raw_preview = repr(last_raw)[:800] if last_raw is not None else "<no raw captured>"
+        raw_preview = repr(last_raw)[:1000] if last_raw is not None else "<no raw captured>"
         raise RuntimeError(
-            f"No callable LLM methods succeeded. last_err: {last_err} | "
-            f"last_raw_type: {raw_type} | last_raw_preview: {raw_preview}"
+            f"No callable LLM methods succeeded. last_err: {last_err} | last_raw_type: {raw_type} | last_raw_preview: {raw_preview}"
         )
+
 
 # -------------------------
 # Build / load simple index
