@@ -388,7 +388,7 @@ class SimpleQAWrapper:
             prompt_text = f"Question: {query}\nContext:\n{context}"
         return prompt_text, docs
 
-        def _call_llm_variants(self, prompt_text: str):
+    def _call_llm_variants(self, prompt_text: str):
         """
         Preferred call order for ChatGoogleGenerativeAI discovered from debug:
           1) invoke(prompt_str) -> returns AIMessage (has .content)
