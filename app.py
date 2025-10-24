@@ -517,6 +517,62 @@ PROMPT_TEMPLATE_STR = (
 )
 prompt_template = PromptTemplate(input_variables=["question", "context"], template=PROMPT_TEMPLATE_STR)
 
+# -------------------------
+# Adapter class to make SimpleRetriever compatible with LangChain retrievers
+# (Place this immediately ABOVE create_qa_from_retriever)
+# -------------------------
+try:
+    from langchain.schema import BaseRetriever
+except Exception:
+    BaseRetriever = object
+
+class SimpleRetrieverAdapter(BaseRetriever):
+    """
+    Wraps a SimpleRetriever so it can be used anywhere a LangChain retriever is expected.
+    Ensure this class is defined BEFORE create_qa_from_retriever is used.
+    """
+    model_config = {"extra": "allow"}
+
+    def __init__(self, simple_retriever):
+        object.__setattr__(self, "simple", simple_retriever)
+        object.__setattr__(self, "tags", [])
+        object.__setattr__(self, "metadata", {})
+
+    def __getattr__(self, name):
+        try:
+            return getattr(self.simple, name)
+        except AttributeError:
+            raise AttributeError(f"{self.__class__.__name__} has no attribute {name}")
+
+    def get_relevant_documents(self, query: str):
+        return self.simple.get_relevant_documents(query)
+
+    async def aget_relevant_documents(self, query: str):
+        return self.get_relevant_documents(query)
+
+    def get_relevant_documents_with_score(self, query: str):
+        """
+        Optionally return documents with similarity scores.
+        """
+        if hasattr(self.simple, "vectors") and hasattr(self.simple, "docs") and hasattr(self.simple, "embeddings"):
+            try:
+                embeddings = self.simple.embeddings
+                if hasattr(embeddings, "embed_query"):
+                    qvec = np.array(embeddings.embed_query(query))
+                else:
+                    qvec = np.array(embeddings.embed_documents([query]))[0]
+            except Exception:
+                qvec = np.array(embeddings.embed_documents([query]))[0]
+
+            vecs = self.simple.vectors
+            denom = (np.linalg.norm(vecs, axis=1) * (np.linalg.norm(qvec) + 1e-12)) + 1e-12
+            sims = np.dot(vecs, qvec) / denom
+            sims = np.nan_to_num(sims)
+            topk_idxs = sims.argsort()[::-1][: self.simple.k if hasattr(self.simple, "k") else sims.shape[0]]
+            return [(self.simple.docs[i], float(sims[i])) for i in topk_idxs]
+        else:
+            docs = self.simple.get_relevant_documents(query)
+            return [(d, 1.0) for d in docs]
 
 # -------------------------
 # Create QA chain (robust, supports different langchain layouts)
