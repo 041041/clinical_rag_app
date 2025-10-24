@@ -611,6 +611,53 @@ def create_qa_from_retriever(retriever):
     except Exception as e:
         st.warning(f"⚠️ Could not create RetrievalQA chain (falling back to internal wrapper): {e}")
         return SimpleQAWrapper(llm=llm, retriever=wrapped, prompt_template=prompt_template)
+# ----- TEMPORARY DEBUG BLOCK: paste right after `llm = ChatGoogleGenerativeAI(...)` -----
+try:
+    st.sidebar.markdown("### 🔍 LLM quick debug (temporary)")
+
+    llm_type = type(llm).__name__
+    st.sidebar.text(f"LLM type: {llm_type}")
+
+    # show some callable names
+    callables = [n for n in dir(llm) if callable(getattr(llm, n, None))]
+    st.sidebar.text("Some callables: " + ", ".join(callables[:30]))
+
+    # Try invoking the LLM using the path that worked in terminal: invoke(str)
+    debug_prompt = "Hello from debug - test"
+    try:
+        inv_fn = getattr(llm, "invoke", None)
+        if callable(inv_fn):
+            inv_raw = inv_fn(debug_prompt)
+            st.sidebar.text("invoke(str) succeeded")
+            st.sidebar.text("Returned type: " + type(inv_raw).__name__)
+            st.sidebar.code(repr(inv_raw)[:3000])
+            # show content if present
+            if hasattr(inv_raw, "content"):
+                st.sidebar.text("inv_raw.content (preview):")
+                st.sidebar.code(getattr(inv_raw, "content")[:2000])
+        else:
+            st.sidebar.text("invoke not callable")
+    except Exception as e:
+        st.sidebar.error("invoke(str) raised: " + repr(e))
+
+    # Also try generate with a message-shaped payload (safe attempt)
+    try:
+        gen_fn = getattr(llm, "generate", None)
+        if callable(gen_fn):
+            try:
+                gen_raw = gen_fn([{"content": debug_prompt}])
+                st.sidebar.text("generate(list-of-dicts) returned type: " + type(gen_raw).__name__)
+                st.sidebar.code(repr(gen_raw)[:3000])
+            except Exception as e:
+                st.sidebar.text("generate() raised: " + repr(e))
+        else:
+            st.sidebar.text("generate not callable")
+    except Exception as e:
+        st.sidebar.error("generate test exception: " + repr(e))
+
+except Exception as e:
+    st.sidebar.error("LLM debug block failed: " + repr(e))
+# ----- END DEBUG BLOCK -----
 
 
 # -------------------------
