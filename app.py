@@ -857,7 +857,7 @@ class SimpleQAWrapper:
         except Exception as e:
             raise
 
-        def _call_llm_variants(self, prompt_text: str):
+    def _call_llm_variants(self, prompt_text: str):
         """
         Robustly call the LLM using the most-likely methods for ChatGoogleGenerativeAI:
           1) generate([prompt_text])
