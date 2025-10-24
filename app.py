@@ -364,46 +364,89 @@ class SimpleRetriever:
         docs_out = [self.docs[i] for i in topk]
         return docs_out
 
-class SimpleRetrieverAdapter(BaseRetriever):
-    model_config = {"extra": "allow"}
+# -------------------------
+# Robust fallback QA wrapper — final stable version
+# -------------------------
+class SimpleQAWrapper:
+    def __init__(self, llm, retriever, prompt_template):
+        self.llm = llm
+        self.retriever = retriever
+        self.prompt = prompt_template
 
-    def __init__(self, simple_retriever):
-        object.__setattr__(self, "simple", simple_retriever)
-        object.__setattr__(self, "tags", [])
-        object.__setattr__(self, "metadata", {})
-
-    def __getattr__(self, name):
-        try:
-            return getattr(self.simple, name)
-        except AttributeError:
-            raise AttributeError(f"{self.__class__.__name__} has no attribute {name}")
-
-    def get_relevant_documents(self, query: str):
-        return self.simple.get_relevant_documents(query)
-
-    async def aget_relevant_documents(self, query: str):
-        return self.get_relevant_documents(query)
-
-    def get_relevant_documents_with_score(self, query: str):
-        if hasattr(self.simple, "vectors") and hasattr(self.simple, "docs") and hasattr(self.simple, "embeddings"):
-            try:
-                embeddings = self.simple.embeddings
-                if hasattr(embeddings, "embed_query"):
-                    qvec = np.array(embeddings.embed_query(query))
-                else:
-                    qvec = np.array(embeddings.embed_documents([query]))[0]
-            except Exception:
-                qvec = np.array(embeddings.embed_documents([query]))[0]
-
-            vecs = self.simple.vectors
-            denom = (np.linalg.norm(vecs, axis=1) * (np.linalg.norm(qvec) + 1e-12)) + 1e-12
-            sims = np.dot(vecs, qvec) / denom
-            sims = np.nan_to_num(sims)
-            topk_idxs = sims.argsort()[::-1][: self.simple.k if hasattr(self.simple, "k") else sims.shape[0]]
-            return [(self.simple.docs[i], float(sims[i])) for i in topk_idxs]
+    def _build_input(self, query):
+        docs = self.retriever.get_relevant_documents(query)
+        context = "\n\n".join([d.page_content for d in docs])
+        if hasattr(self.prompt, "template"):
+            prompt_text = self.prompt.template.format(question=query, context=context)
         else:
-            docs = self.simple.get_relevant_documents(query)
-            return [(d, 1.0) for d in docs]
+            prompt_text = f"Question: {query}\nContext:\n{context}"
+        return prompt_text, docs
+
+    def _call_llm_variants(self, prompt_text):
+        """
+        Try known LLM call patterns and always return (text, raw, source_documents_candidate)
+        """
+        last_err = None
+        call_patterns = [
+            ("predict", getattr(self.llm, "predict", None)),
+            ("generate", getattr(self.llm, "generate", None)),
+            ("call", getattr(self.llm, "__call__", None)),
+            ("plain_call", None),  # fallback to llm(prompt_text) or llm({"input": ...})
+        ]
+
+        for name, fn in call_patterns:
+            if fn is None and name != "plain_call":
+                continue
+            try:
+                if name == "generate":
+                    raw = fn([prompt_text])
+                elif name in ("predict", "call"):
+                    raw = fn(prompt_text)
+                else:
+                    # plain_call fallback: try dict shape, then string shape
+                    try:
+                        raw = self.llm({"input": prompt_text})
+                    except Exception:
+                        try:
+                            raw = self.llm({"prompt": prompt_text})
+                        except Exception:
+                            raw = self.llm(prompt_text)
+
+                text, raw_saved = _extract_text_from_llm_response(raw)
+                # attempt to collect any source_documents attached to raw
+                source_docs = (
+                    getattr(raw, "source_documents", None)
+                    or (raw.get("source_documents") if isinstance(raw, dict) else None)
+                    or []
+                )
+                return text, raw_saved, source_docs
+            except Exception as e:
+                last_err = e
+                continue
+
+        # final attempt: try calling llm synchronously and stringify result
+        try:
+            raw = self.llm(prompt_text)
+            text, raw_saved = _extract_text_from_llm_response(raw)
+            source_docs = (
+                getattr(raw, "source_documents", None)
+                or (raw.get("source_documents") if isinstance(raw, dict) else None)
+                or []
+            )
+            return text, raw_saved, source_docs
+        except Exception as e:
+            raise RuntimeError(f"LLM call failed: {e} | last_error: {last_err}")
+
+    def run(self, query):
+        prompt_text, docs = self._build_input(query)
+        try:
+            text, raw, src_docs = self._call_llm_variants(prompt_text)
+            # prefer src_docs if present otherwise return the retriever docs
+            source_documents = src_docs or docs
+            return {"result": text, "source_documents": source_documents, "raw": raw}
+        except Exception as e:
+            raise RuntimeError(f"LLM call failed: {e}")
+
 
 
 # -------------------------
