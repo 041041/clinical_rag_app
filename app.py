@@ -549,78 +549,88 @@ def create_qa_from_retriever(retriever):
             return qa
         except Exception:
             # Fallback minimal wrapper
-            # Robust fallback QA wrapper — REPLACE any previous SimpleQAWrapper with this one.
-class SimpleQAWrapper:
-    def __init__(self, llm, retriever, prompt_template):
-        self.llm = llm
-        self.retriever = retriever
-        self.prompt = prompt_template
+            class SimpleQAWrapper:
+                def __init__(self, llm, retriever, prompt_template):
+                    self.llm = llm
+                    self.retriever = retriever
+                    self.prompt = prompt_template
 
-    def _build_input(self, query):
-        docs = self.retriever.get_relevant_documents(query)
-        context = "\n\n".join([d.page_content for d in docs])
-        prompt_text = self.prompt.template.format(question=query, context=context) if hasattr(self.prompt, "template") else f"Question: {query}\nContext:\n{context}"
-        return prompt_text, docs
+                def _build_input(self, query):
+                    docs = self.retriever.get_relevant_documents(query)
+                    context = "\n\n".join([d.page_content for d in docs])
+                    if hasattr(self.prompt, "template"):
+                        prompt_text = self.prompt.template.format(question=query, context=context)
+                    else:
+                        prompt_text = f"Question: {query}\nContext:\n{context}"
+                    return prompt_text, docs
 
-    def _call_llm_variants(self, prompt_text):
-        """
-        Try known LLM call patterns and always return (text, raw, source_documents_candidate)
-        where 'text' is extracted using _extract_text_from_llm_response.
-        """
-        last_err = None
-        # candidate call patterns: predict(prompt), generate([prompt]), llm(prompt), llm({"input":...})
-        call_patterns = [
-            ("predict", getattr(self.llm, "predict", None)),
-            ("generate", getattr(self.llm, "generate", None)),
-            ("call", getattr(self.llm, "__call__", None)),
-            ("plain_call", None),  # fallback to calling llm(prompt_text) or llm({"input":...})
-        ]
-        for name, fn in call_patterns:
-            if fn is None and name != "plain_call":
-                continue
-            try:
-                if name == "generate":
-                    raw = fn([prompt_text])
-                elif name == "predict" or name == "call":
-                    raw = fn(prompt_text)
-                else:
-                    # plain_call fallback: try dict shape, then string shape
-                    try:
-                        raw = self.llm({"input": prompt_text})
-                    except Exception:
+                def _call_llm_variants(self, prompt_text):
+                    """
+                    Try known LLM call patterns and always return (text, raw, source_documents_candidate)
+                    """
+                    last_err = None
+                    call_patterns = [
+                        ("predict", getattr(self.llm, "predict", None)),
+                        ("generate", getattr(self.llm, "generate", None)),
+                        ("call", getattr(self.llm, "__call__", None)),
+                        ("plain_call", None),  # fallback to llm(prompt_text) or llm({"input": ...})
+                    ]
+
+                    for name, fn in call_patterns:
+                        if fn is None and name != "plain_call":
+                            continue
                         try:
-                            raw = self.llm({"prompt": prompt_text})
-                        except Exception:
-                            raw = self.llm(prompt_text)
-                text, raw_saved = _extract_text_from_llm_response(raw)
-                # attempt to collect any source_documents attached to raw
-                source_docs = getattr(raw, "source_documents", None) or (raw.get("source_documents") if isinstance(raw, dict) else None) or []
-                return text, raw_saved, source_docs
-            except Exception as e:
-                last_err = e
-                continue
+                            if name == "generate":
+                                raw = fn([prompt_text])
+                            elif name in ("predict", "call"):
+                                raw = fn(prompt_text)
+                            else:
+                                # plain_call fallback: try dict shape, then string shape
+                                try:
+                                    raw = self.llm({"input": prompt_text})
+                                except Exception:
+                                    try:
+                                        raw = self.llm({"prompt": prompt_text})
+                                    except Exception:
+                                        raw = self.llm(prompt_text)
 
-        # final attempt: try calling llm synchronously and stringify result
-        try:
-            raw = self.llm(prompt_text)
-            text, raw_saved = _extract_text_from_llm_response(raw)
-            source_docs = getattr(raw, "source_documents", None) or (raw.get("source_documents") if isinstance(raw, dict) else None) or []
-            return text, raw_saved, source_docs
-        except Exception as e:
-            raise RuntimeError(f"LLM call failed: {e} | last_error: {last_err}")
+                            text, raw_saved = _extract_text_from_llm_response(raw)
+                            # attempt to collect any source_documents attached to raw
+                            source_docs = (
+                                getattr(raw, "source_documents", None)
+                                or (raw.get("source_documents") if isinstance(raw, dict) else None)
+                                or []
+                            )
+                            return text, raw_saved, source_docs
+                        except Exception as e:
+                            last_err = e
+                            continue
 
-    def run(self, query):
-        prompt_text, docs = self._build_input(query)
-        try:
-            text, raw, src_docs = self._call_llm_variants(prompt_text)
-            # prefer src_docs if present otherwise return the retriever docs
-            source_documents = src_docs or docs
-            return {"result": text, "source_documents": source_documents, "raw": raw}
-        except Exception as e:
-            # bubble a clear error so the outer retry logic can capture raw/type if present
-            raise RuntimeError(f"LLM call failed: {e}")
+                    # final attempt: try calling llm synchronously and stringify result
+                    try:
+                        raw = self.llm(prompt_text)
+                        text, raw_saved = _extract_text_from_llm_response(raw)
+                        source_docs = (
+                            getattr(raw, "source_documents", None)
+                            or (raw.get("source_documents") if isinstance(raw, dict) else None)
+                            or []
+                        )
+                        return text, raw_saved, source_docs
+                    except Exception as e:
+                        raise RuntimeError(f"LLM call failed: {e} | last_error: {last_err}")
 
+                def run(self, query):
+                    prompt_text, docs = self._build_input(query)
+                    try:
+                        text, raw, src_docs = self._call_llm_variants(prompt_text)
+                        # prefer src_docs if present otherwise return the retriever docs
+                        source_documents = src_docs or docs
+                        return {"result": text, "source_documents": source_documents, "raw": raw}
+                    except Exception as e:
+                        raise RuntimeError(f"LLM call failed: {e}")
 
+            # instantiate fallback wrapper
+            return SimpleQAWrapper(llm, wrapped, prompt_template)
 
 # -------------------------
 # Helper: robust extractor for LLM responses
