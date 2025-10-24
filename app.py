@@ -602,7 +602,6 @@ def create_qa_from_retriever(retriever):
     try:
         if RetrievalQA is None:
             raise ImportError("RetrievalQA not importable in this environment.")
-        # Use from_chain_type if available and compatible
         qa = RetrievalQA.from_chain_type(
             llm=llm,
             retriever=wrapped,
@@ -612,80 +611,75 @@ def create_qa_from_retriever(retriever):
         )
         return qa
     except Exception as e:
-        # If any error occurs constructing the LangChain RetrievalQA (version mismatches, internal calls),
-        # fallback to our robust SimpleQAWrapper which handles calling the LLM safely.
         st.warning(f"⚠️ Could not create RetrievalQA chain (falling back to internal wrapper): {e}")
-        # Ensure SimpleQAWrapper is defined at module level and is robust
         return SimpleQAWrapper(llm=llm, retriever=wrapped, prompt_template=prompt_template)
 
 
 # -------------------------
 # Helper: robust extractor for LLM responses
 # -------------------------
+# -------------------------
+# Robust extractor for LLM responses
+# -------------------------
 def _extract_text_from_llm_response(raw):
     """
-    Take arbitrary raw LLM response and try many known extraction patterns.
-    Returns a string (possibly empty) and the original raw for debugging.
+    Normalize many possible LLM SDK return shapes into a plain string and return (text, raw).
     """
     try:
+        if raw is None:
+            return "", raw
+
         # if it's already a string
         if isinstance(raw, str):
             return raw, raw
 
         # dict-like responses
         if isinstance(raw, dict):
-            # common keys
             for k in ("result", "text", "content", "message", "output", "response"):
                 if k in raw and isinstance(raw[k], str):
                     return raw[k], raw
-            # nested candidate lists
             if "candidates" in raw and isinstance(raw["candidates"], (list, tuple)) and raw["candidates"]:
                 c = raw["candidates"][0]
                 if isinstance(c, str):
                     return c, raw
-                if isinstance(c, dict) and "text" in c:
-                    return c["text"], raw
+                if isinstance(c, dict) and "content" in c and isinstance(c["content"], str):
+                    return c["content"], raw
 
-        # LangChain Generation-like object: has .generations
+        # objects with .generations (LangChain)
         if hasattr(raw, "generations"):
-            gens = getattr(raw, "generations")
-            # gens often is list[list[Generation]]
             try:
-                first = gens[0]
-                if isinstance(first, list):
-                    g = first[0]
-                else:
-                    g = first
-                # Try multiple attributes
-                for attr in ("text", "content", "message", "data"):
-                    if hasattr(g, attr):
-                        val = getattr(g, attr)
-                        # nested .message.content if message object exists
-                        if isinstance(val, str) and val:
-                            return val, raw
-                        if hasattr(val, "content") and isinstance(val.content, str):
-                            return val.content, raw
-                # try .text attribute fallback
-                if hasattr(g, "text") and isinstance(g.text, str):
-                    return g.text, raw
+                gens = getattr(raw, "generations")
+                if gens:
+                    first = gens[0]
+                    if isinstance(first, list) and first:
+                        g = first[0]
+                    else:
+                        g = first
+                    for attr in ("text", "content", "message"):
+                        if hasattr(g, attr):
+                            val = getattr(g, attr)
+                            if isinstance(val, str) and val:
+                                return val, raw
+                            if hasattr(val, "content") and isinstance(val.content, str):
+                                return val.content, raw
+                    if hasattr(g, "text") and isinstance(g.text, str):
+                        return g.text, raw
             except Exception:
                 pass
 
-        # Some SDKs return an object with .message or .content directly
-        for attr in ("content", "text", "message"):
+        # simple object attributes
+        for attr in ("content", "text", "message", "result"):
             if hasattr(raw, attr):
                 val = getattr(raw, attr)
                 if isinstance(val, str):
                     return val, raw
-                if hasattr(val, "content") and isinstance(val.content, str):
+                if hasattr(val, "content") and isinstance(getattr(val, "content"), str):
                     return val.content, raw
 
-        # fallback: stringify
+        # fallback stringify
         return str(raw), raw
     except Exception as e:
-        # best-effort fallback
         return f"<unextractable response: {e}>", raw
-
 
 # -------------------------
 # Updated safe chain caller (more tolerant)
@@ -792,58 +786,107 @@ def _call_chain_safe(qa_chain, query: str):
 # Fallback SimpleQAWrapper.run with robust extraction
 # -------------------------
 class SimpleQAWrapper:
+    """
+    Robust QA wrapper that only calls callable methods on the LLM object.
+    NEVER calls the LLM object directly (no self.llm(...)).
+    """
+
     def __init__(self, llm, retriever, prompt_template):
         self.llm = llm
         self.retriever = retriever
         self.prompt = prompt_template
 
-    def _build_input(self, query):
+    def _build_input(self, query: str):
         docs = self.retriever.get_relevant_documents(query)
         context = "\n\n".join([d.page_content for d in docs])
-        prompt_text = self.prompt.template.format(question=query, context=context) if hasattr(self.prompt, "template") else f"Question: {query}\nContext:\n{context}"
+        if hasattr(self.prompt, "template"):
+            prompt_text = self.prompt.template.format(question=query, context=context)
+        else:
+            prompt_text = f"Question: {query}\nContext:\n{context}"
         return prompt_text, docs
 
-    def run(self, query):
-        prompt_text, docs = self._build_input(query)
+    def _list_callable_methods(self):
+        names = []
+        for name in dir(self.llm):
+            try:
+                attr = getattr(self.llm, name)
+                if callable(attr):
+                    names.append(name)
+            except Exception:
+                continue
+        return names
 
-        # Try common call patterns and extract text robustly
+    def _call_via_method(self, fn, name, prompt_text):
+        try:
+            if name == "generate":
+                raw = fn([prompt_text])
+            else:
+                raw = fn(prompt_text)
+            text, raw_saved = _extract_text_from_llm_response(raw)
+            source_docs = getattr(raw, "source_documents", None) or (raw.get("source_documents") if isinstance(raw, dict) else None) or []
+            return text, raw_saved, source_docs
+        except Exception as e:
+            raise
+
+    def _call_llm_variants(self, prompt_text: str):
+        """
+        Prioritized safe callable method invocation. If nothing works, raise with debug info.
+        """
         last_err = None
-        call_fns = [
-            ("predict", getattr(self.llm, "predict", None)),
+
+        # Preferred: ChatGoogleGenerativeAI.generate (if available & callable)
+        try:
+            if "ChatGoogleGenerativeAI" in globals() and ChatGoogleGenerativeAI is not None and isinstance(self.llm, ChatGoogleGenerativeAI):
+                gen_fn = getattr(self.llm, "generate", None)
+                if callable(gen_fn):
+                    try:
+                        raw = gen_fn([prompt_text])
+                        text, raw_saved = _extract_text_from_llm_response(raw)
+                        source_docs = getattr(raw, "source_documents", None) or (raw.get("source_documents") if isinstance(raw, dict) else None) or []
+                        return text, raw_saved, source_docs
+                    except Exception as e:
+                        last_err = e
+        except Exception:
+            last_err = last_err or None
+
+        # Try common callables: generate, predict, create, chat, etc.
+        method_candidates = [
             ("generate", getattr(self.llm, "generate", None)),
+            ("predict", getattr(self.llm, "predict", None)),
+            ("create", getattr(self.llm, "create", None)),
+            ("chat", getattr(self.llm, "chat", None)),
+            ("respond", getattr(self.llm, "respond", None)),
+            ("answer", getattr(self.llm, "answer", None)),
             ("__call__", getattr(self.llm, "__call__", None)),
-            ("__call___dict", None)  # will attempt llm({"input": prompt_text}) if others fail
         ]
-        for name, fn in call_fns:
-            if not fn and name != "__call___dict":
+
+        for name, fn in method_candidates:
+            if not callable(fn):
                 continue
             try:
-                if name == "__call___dict":
-                    # try dict form
-                    try:
-                        raw = self.llm({"input": prompt_text})
-                    except Exception:
-                        raw = self.llm({"prompt": prompt_text})
-                elif name == "generate":
-                    # some generate APIs expect a list
-                    raw = fn([prompt_text])
-                else:
-                    raw = fn(prompt_text)
-
-                text, raw_saved = _extract_text_from_llm_response(raw)
-                return {"result": text, "source_documents": docs, "raw": raw_saved}
+                return self._call_via_method(fn, name, prompt_text)
             except Exception as e:
                 last_err = e
                 continue
 
-        # If we reach here, try direct string attempt (call llm as callable)
-        try:
-            raw = self.llm(prompt_text)
-            text, raw_saved = _extract_text_from_llm_response(raw)
-            return {"result": text, "source_documents": docs, "raw": raw_saved}
-        except Exception as e:
-            raise RuntimeError(f"LLM call failed: {e} | last_err: {last_err}")
+        # No callable succeeded — raise helpful debug error
+        llm_type = type(self.llm).__name__
+        callable_names = self._list_callable_methods()
+        raise RuntimeError(
+            "No callable LLM methods succeeded. "
+            f"LLM type: {llm_type}. "
+            f"Callable methods: {callable_names}. "
+            f"Last error: {last_err}"
+        )
 
+    def run(self, query: str):
+        prompt_text, docs = self._build_input(query)
+        try:
+            text, raw, src_docs = self._call_llm_variants(prompt_text)
+            source_documents = src_docs or docs
+            return {"result": text, "source_documents": source_documents, "raw": raw}
+        except Exception as e:
+            raise RuntimeError(f"LLM call failed: {e}")
 
 def query_with_features(qa_chain, query: str):
     """
