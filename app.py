@@ -388,73 +388,102 @@ class SimpleQAWrapper:
             prompt_text = f"Question: {query}\nContext:\n{context}"
         return prompt_text, docs
 
-    def _call_llm_variants(self, prompt_text: str):
+        def _call_llm_variants(self, prompt_text: str):
         """
-        Call the LLM using safe, callable methods only. Return (text, raw, source_docs).
-        Does NOT call self.llm(...) directly.
+        Robustly call the LLM using the most-likely methods for ChatGoogleGenerativeAI:
+          1) generate([prompt_text])
+          2) invoke({"query": prompt_text}) or invoke(prompt_text)
+          3) agenerate / ainvoke (async) are not attempted here (sync only)
+        Normalize result via _extract_text_from_llm_response.
         """
         last_err = None
+        last_raw = None
 
-        # 1) Preferred: ChatGoogleGenerativeAI -> generate(list)
-        try:
-            if "ChatGoogleGenerativeAI" in globals() and ChatGoogleGenerativeAI is not None and isinstance(self.llm, ChatGoogleGenerativeAI):
-                gen_fn = getattr(self.llm, "generate", None)
-                if callable(gen_fn):
-                    raw = gen_fn([prompt_text])
-                    text, raw_saved = _extract_text_from_llm_response(raw)
-                    source_docs = getattr(raw, "source_documents", None) or (raw.get("source_documents") if isinstance(raw, dict) else None) or []
-                    return text, raw_saved, source_docs
-        except Exception as e:
-            last_err = e  # fallthrough to try other methods
+        # 1) Prefer generate(list_of_prompts)
+        gen_fn = getattr(self.llm, "generate", None)
+        if callable(gen_fn):
+            try:
+                raw = gen_fn([prompt_text])
+                last_raw = raw
+                text, raw_saved = _extract_text_from_llm_response(raw)
+                source_docs = (
+                    getattr(raw, "source_documents", None)
+                    or (raw.get("source_documents") if isinstance(raw, dict) else None)
+                    or []
+                )
+                return text, raw_saved, source_docs
+            except Exception as e:
+                last_err = e
 
-        # 2) Try a list of common method names, only if they are callable
-        candidates = [
-            ("generate", getattr(self.llm, "generate", None)),
-            ("predict", getattr(self.llm, "predict", None)),
-            ("__call__", getattr(self.llm, "__call__", None)),
-        ]
-        for name, fn in candidates:
+        # 2) Try invoke with dict or string forms
+        inv_fn = getattr(self.llm, "invoke", None)
+        if callable(inv_fn):
+            try:
+                raw = inv_fn({"query": prompt_text})
+                last_raw = raw
+                text, raw_saved = _extract_text_from_llm_response(raw)
+                source_docs = (
+                    getattr(raw, "source_documents", None)
+                    or (raw.get("source_documents") if isinstance(raw, dict) else None)
+                    or []
+                )
+                return text, raw_saved, source_docs
+            except Exception as e:
+                last_err = e
+            try:
+                raw = inv_fn(prompt_text)
+                last_raw = raw
+                text, raw_saved = _extract_text_from_llm_response(raw)
+                source_docs = (
+                    getattr(raw, "source_documents", None)
+                    or (raw.get("source_documents") if isinstance(raw, dict) else None)
+                    or []
+                )
+                return text, raw_saved, source_docs
+            except Exception as e:
+                last_err = e
+
+        # 3) Try generate with list-of-dict payload
+        if callable(gen_fn):
+            try:
+                raw = gen_fn([{"content": prompt_text}])
+                last_raw = raw
+                text, raw_saved = _extract_text_from_llm_response(raw)
+                source_docs = (
+                    getattr(raw, "source_documents", None)
+                    or (raw.get("source_documents") if isinstance(raw, dict) else None)
+                    or []
+                )
+                return text, raw_saved, source_docs
+            except Exception as e:
+                last_err = e
+
+        # 4) Try other common callables
+        for name in ("predict", "create", "chat", "respond", "answer"):
+            fn = getattr(self.llm, name, None)
             if not callable(fn):
                 continue
             try:
-                if name == "generate":
-                    raw = fn([prompt_text])
-                else:
-                    # predict or __call__ method that behaves like predict
-                    raw = fn(prompt_text)
+                raw = fn(prompt_text) if name != "generate" else fn([prompt_text])
+                last_raw = raw
                 text, raw_saved = _extract_text_from_llm_response(raw)
-                source_docs = getattr(raw, "source_documents", None) or (raw.get("source_documents") if isinstance(raw, dict) else None) or []
+                source_docs = (
+                    getattr(raw, "source_documents", None)
+                    or (raw.get("source_documents") if isinstance(raw, dict) else None)
+                    or []
+                )
                 return text, raw_saved, source_docs
             except Exception as e:
                 last_err = e
                 continue
 
-        # 3) If there is a documented 'chat' or 'create' type method, try common names (only if callable)
-        for alt_name in ("chat", "create", "generate_response", "respond"):
-            fn = getattr(self.llm, alt_name, None)
-            if not callable(fn):
-                continue
-            try:
-                # try single string input; some methods accept dicts but we avoid calling object directly
-                raw = fn(prompt_text)
-                text, raw_saved = _extract_text_from_llm_response(raw)
-                source_docs = getattr(raw, "source_documents", None) or (raw.get("source_documents") if isinstance(raw, dict) else None) or []
-                return text, raw_saved, source_docs
-            except Exception as e:
-                last_err = e
-                continue
-
-        # 4) Final: no suitable callable succeeded — raise helpful error
-        raise RuntimeError(f"No suitable LLM call succeeded; last_error: {last_err}")
-
-    def run(self, query: str):
-        prompt_text, docs = self._build_input(query)
-        try:
-            text, raw, src_docs = self._call_llm_variants(prompt_text)
-            source_documents = src_docs or docs
-            return {"result": text, "source_documents": source_documents, "raw": raw}
-        except Exception as e:
-            raise RuntimeError(f"LLM call failed: {e}")
+        # 5) Nothing worked — raise with helpful debug info
+        raw_type = type(last_raw).__name__ if last_raw is not None else "None"
+        raw_preview = repr(last_raw)[:800] if last_raw is not None else "<no raw captured>"
+        raise RuntimeError(
+            f"No callable LLM methods succeeded. last_err: {last_err} | "
+            f"last_raw_type: {raw_type} | last_raw_preview: {raw_preview}"
+        )
 
 # -------------------------
 # Build / load simple index
