@@ -369,10 +369,9 @@ class SimpleRetriever:
 # -------------------------
 class SimpleQAWrapper:
     """
-    Robust fallback QA wrapper that works with many LLM wrapper shapes.
-    - Uses _extract_text_from_llm_response(raw) to normalize text.
-    - Special-cases ChatGoogleGenerativeAI to call .generate(...)
-    - Never calls the LLM object directly as a function.
+    Robust fallback QA wrapper that NEVER calls the LLM object directly.
+    Uses only callable named methods (generate, predict, __call__ if callable).
+    Normalizes outputs via _extract_text_from_llm_response.
     """
 
     def __init__(self, llm, retriever, prompt_template):
@@ -391,38 +390,37 @@ class SimpleQAWrapper:
 
     def _call_llm_variants(self, prompt_text: str):
         """
-        Call the LLM using several safe patterns and return (text, raw, source_docs).
-        Will not call the LLM object directly if it's not callable.
+        Call the LLM using safe, callable methods only. Return (text, raw, source_docs).
+        Does NOT call self.llm(...) directly.
         """
         last_err = None
 
-        # 1) If it's the ChatGoogleGenerativeAI wrapper, prefer .generate(list)
+        # 1) Preferred: ChatGoogleGenerativeAI -> generate(list)
         try:
             if "ChatGoogleGenerativeAI" in globals() and ChatGoogleGenerativeAI is not None and isinstance(self.llm, ChatGoogleGenerativeAI):
-                try:
-                    raw = self.llm.generate([prompt_text])
+                gen_fn = getattr(self.llm, "generate", None)
+                if callable(gen_fn):
+                    raw = gen_fn([prompt_text])
                     text, raw_saved = _extract_text_from_llm_response(raw)
                     source_docs = getattr(raw, "source_documents", None) or (raw.get("source_documents") if isinstance(raw, dict) else None) or []
                     return text, raw_saved, source_docs
-                except Exception as e:
-                    last_err = e  # fall through to other methods
-        except Exception:
-            last_err = last_err or None
+        except Exception as e:
+            last_err = e  # fallthrough to try other methods
 
-        # 2) Try common named methods (generate, predict, __call__)
-        call_patterns = [
+        # 2) Try a list of common method names, only if they are callable
+        candidates = [
             ("generate", getattr(self.llm, "generate", None)),
             ("predict", getattr(self.llm, "predict", None)),
             ("__call__", getattr(self.llm, "__call__", None)),
         ]
-        for name, fn in call_patterns:
-            if not fn:
+        for name, fn in candidates:
+            if not callable(fn):
                 continue
             try:
                 if name == "generate":
                     raw = fn([prompt_text])
                 else:
-                    # some predict/__call__ methods accept a plain string
+                    # predict or __call__ method that behaves like predict
                     raw = fn(prompt_text)
                 text, raw_saved = _extract_text_from_llm_response(raw)
                 source_docs = getattr(raw, "source_documents", None) or (raw.get("source_documents") if isinstance(raw, dict) else None) or []
@@ -431,56 +429,32 @@ class SimpleQAWrapper:
                 last_err = e
                 continue
 
-        # 3) Try dict-shaped calls some SDKs expect (llm({"input": ...}) or llm({"prompt": ...}))
-        try:
-            raw = None
+        # 3) If there is a documented 'chat' or 'create' type method, try common names (only if callable)
+        for alt_name in ("chat", "create", "generate_response", "respond"):
+            fn = getattr(self.llm, alt_name, None)
+            if not callable(fn):
+                continue
             try:
-                raw = self.llm({"input": prompt_text})
-            except Exception:
-                try:
-                    raw = self.llm({"prompt": prompt_text})
-                except Exception:
-                    raw = None
-
-            if raw is not None:
+                # try single string input; some methods accept dicts but we avoid calling object directly
+                raw = fn(prompt_text)
                 text, raw_saved = _extract_text_from_llm_response(raw)
                 source_docs = getattr(raw, "source_documents", None) or (raw.get("source_documents") if isinstance(raw, dict) else None) or []
                 return text, raw_saved, source_docs
-        except Exception as e:
-            last_err = e
+            except Exception as e:
+                last_err = e
+                continue
 
-        # 4) Try generate with list-of-dicts (some wrappers accept content key)
-        try:
-            gen_fn = getattr(self.llm, "generate", None)
-            if gen_fn:
-                try:
-                    raw = gen_fn([{"content": prompt_text}])
-                    text, raw_saved = _extract_text_from_llm_response(raw)
-                    source_docs = getattr(raw, "source_documents", None) or (raw.get("source_documents") if isinstance(raw, dict) else None) or []
-                    return text, raw_saved, source_docs
-                except Exception:
-                    pass
-        except Exception as e:
-            last_err = e
-
-        # 5) Final: no suitable call succeeded — raise with helpful info
+        # 4) Final: no suitable callable succeeded — raise helpful error
         raise RuntimeError(f"No suitable LLM call succeeded; last_error: {last_err}")
 
     def run(self, query: str):
-        """
-        Build input, call LLM safely, return normalized dict:
-          {"result": <str>, "source_documents": [Document,...], "raw": raw}
-        """
         prompt_text, docs = self._build_input(query)
         try:
             text, raw, src_docs = self._call_llm_variants(prompt_text)
             source_documents = src_docs or docs
             return {"result": text, "source_documents": source_documents, "raw": raw}
         except Exception as e:
-            # bubble a clean error so outer retry logic can capture it and print debug details
             raise RuntimeError(f"LLM call failed: {e}")
-
-
 
 # -------------------------
 # Build / load simple index
