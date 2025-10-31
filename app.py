@@ -556,8 +556,7 @@ def load_or_build_simple_index_for_user(user_folder: Path):
 # LLM prompt / QA builder
 # -------------------------
 PROMPT_TEMPLATE_STR = (
-    "You are an expert assistant for clinical trial data standards. Use only the provided context to answer.\n"
-    "If the answer isn't in the context, say 'I don't know from provided docs.' Be concise and use bullet points when helpful.\n\n"
+    "You are an expert assistant for clinical trial data standards. Be concise and use bullet points when helpful.\n\n"
     "Question: {question}\nContext:\n{context}\n\nAnswer:"
 )
 prompt_template = PromptTemplate(input_variables=["question", "context"], template=PROMPT_TEMPLATE_STR)
